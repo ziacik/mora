@@ -176,6 +176,37 @@ def _vision_perceive(image,concept,model,api_key,detail='high'):
         if quad_valid(q):out.append(q)
     return out
 
+
+def _number_add(a,b): return float(a)+float(b)
+def _number_clamp(value,low,high): return max(float(low),min(float(high),float(value)))
+def _number_less(a,b): return float(a)<float(b)
+def _number_greater(a,b): return float(a)>float(b)
+
+def _motion_advance(x,y,vx,vy,dt=1):
+    d=float(dt)
+    return {'x':float(x)+float(vx)*d,'y':float(y)+float(vy)*d,'vx':float(vx),'vy':float(vy)}
+
+def _motion_bounce_y(x,y,vx,vy,radius,top,bottom):
+    x,y,vx,vy,r,lo,hi=map(float,(x,y,vx,vy,radius,top,bottom))
+    if y-r<lo and vy<0:
+        y=lo+r+(lo+r-y);vy=-vy
+    elif y+r>hi and vy>0:
+        y=hi-r-(y-(hi-r));vy=-vy
+    return {'x':x,'y':y,'vx':vx,'vy':vy}
+
+def _motion_bounce_rect(x,y,vx,vy,radius,rx,ry,rw,rh):
+    x,y,vx,vy,r,rx,ry,rw,rh=map(float,(x,y,vx,vy,radius,rx,ry,rw,rh))
+    nearest_x=max(rx,min(x,rx+rw));nearest_y=max(ry,min(y,ry+rh))
+    dx,dy=x-nearest_x,y-nearest_y
+    if dx*dx+dy*dy>r*r:return {'x':x,'y':y,'vx':vx,'vy':vy}
+    left=abs((x+r)-rx);right=abs((rx+rw)-(x-r));top=abs((y+r)-ry);bottom=abs((ry+rh)-(y-r))
+    side=min((left,'left'),(right,'right'),(top,'top'),(bottom,'bottom'))[1]
+    if side=='left' and vx>0:x=rx-r;vx=-vx
+    elif side=='right' and vx<0:x=rx+rw+r;vx=-vx
+    elif side=='top' and vy>0:y=ry-r;vy=-vy
+    elif side=='bottom' and vy<0:y=ry+rh+r;vy=-vy
+    return {'x':x,'y':y,'vx':vx,'vy':vy}
+
 class Registry:
     def __init__(self,program,app_id):
         self.program=program;self.app_id=app_id;self.faculties={}
@@ -193,6 +224,8 @@ class Registry:
             self.faculties[alias]=(provider,cfg)
     def provider(self,alias):return self.faculties[alias][0]
     def config(self,alias):return self.faculties[alias][1]
+    def is_async(self,alias):
+        return self.provider(alias) in {'openai.responses','sane','image-codec'}
     def invoke(self,alias,operation,args,options=None):
         if alias not in self.faculties:raise MoraError(f'unknown faculty {alias}')
         provider,cfg=self.faculties[alias];options=options or {}
@@ -203,6 +236,10 @@ class Registry:
             table={'centered-quad':_centered_quad,'expand-each':_expand_each,'perspective-crop':_crop,'move':_move,'move-corner':_move_corner,'move-edge':_move_edge,'bounds':quad_bounds,'contains':point_in_quad,'filter':_filter_quads,'dedupe':_dedupe_quads,'sort-visual':_sort_visual}
             return table[operation](*args)
         if provider=='desktop.files' and operation=='numbered-path':return _numbered_path(*args)
+        if provider=='arithmetic':
+            return {'add':_number_add,'clamp':_number_clamp,'less':_number_less,'greater':_number_greater}[operation](*args)
+        if provider=='geometry2d':
+            return {'advance':_motion_advance,'bounce-y':_motion_bounce_y,'bounce-rect':_motion_bounce_rect}[operation](*args)
         if provider=='openai.responses' and operation=='perceive':
             key=cfg.get('secret_key');secret=_secret_get(self.app_id,key) if key else None
             if key and not secret:raise MissingSecret(alias,key,cfg)

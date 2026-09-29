@@ -1,19 +1,15 @@
-# Mora 0.3
+# Mora 0.4
 
-Mora is an experimental **affective programming language**. Programs express beliefs, evidence, desires, journeys, laws, offers and declarative scenes instead of wiring ordinary callbacks throughout application code.
+Mora is an experimental affective programming language. Applications describe beliefs, evidence, desires, journeys, laws, offers, scenes, and calls to generic faculties.
 
-This repository contains the Mora 0.3 runtime. Version 0.3.1 includes the first GTK4/libadwaita execution backend.
+The runtime must not know an application's domain. In Mora 0.4, desires are executed from the AST through generic operations such as `ask`, `attempt`, `remember`, `snapshot`, `for every`, and `perceive`. A faculty provider exposes general capabilities; application concepts, prompts, thresholds, names, and workflows stay in the `.mora` program.
 
 ## Install on Arch / Manjaro
-
-The language runtime is Python-based; GTK and native faculties use system libraries.
 
 ```bash
 sudo pacman -S python python-gobject gtk4 libadwaita python-pillow python-opencv python-requests sane libsecret
 sh install.sh
 ```
-
-`install.sh` creates an isolated runtime venv with access to system site packages and installs `mora` into `~/.local/bin`.
 
 ## Commands
 
@@ -24,61 +20,37 @@ mora simulate app.mora 'correction(A)' 'correction(A)' 'correction(A)'
 mora run app.mora
 ```
 
-## GTK execution
+## Generic execution model
 
-`mora run` reads the Mora AST directly:
-
-- `scene` / `window` / `header` / `sidebar` / `canvas` become GTK4/libadwaita UI;
-- `button ... invites Desire` dispatches a Mora desire;
-- declared gestures become GTK event controllers;
-- `faculty` declarations are fulfilled by native adapters (GTK, SANE, OpenCV, image codecs, OpenAI Responses, system keyring);
-- perceptions feed the affective engine, which updates beliefs and evaluates journeys;
-- journey `offer` / `withdraw` changes UI assistance such as magnifier, handle size and snapping.
-
-The application itself does **not** contain Python/Rust callbacks. Python here is the language runtime, analogous to CPython being the runtime for Python source.
-
-## Example
+A desire is not dispatched by name inside the runtime:
 
 ```mora
-belief user about emotion {
-    confident   0.45
-    uncertain   0.20
-    frustrated  0.05
-    never certain
-}
-
-meaning repeated correction(frame) within 12s {
-    suggests frustrated strongly
-    suggests uncertain moderately
-}
-
-journey Editing {
-    toward user.confident
-    away from user.frustrated
-
-    when user struggles with current frame {
-        offer PreciseEditing
-    }
+desire LoadSomething {
+    ask files.choose-image as source
+    attempt images.load source as value
+    remember document as value
+    perceive loaded
 }
 ```
 
-## Status
+The runtime only interprets the generic verbs and resolves declared faculties. The same executor can run another application with completely different desire names and domain concepts.
 
-Implemented:
+Vision is also generic. A program supplies its own concept and desired result shape; the OpenAI Responses faculty turns that concept into a structured request. The runtime contains no domain prompt for any particular application.
 
-- recursive `bring`
-- Mora 0.3 block parser
-- rejection of host-language-shaped application constructs (`fn`, `state.foo`, lambdas, callback wiring)
-- beliefs and evidence-producing `meaning`
-- temporal repeated-event evidence
-- patterns and journeys
-- offers / withdrawals
-- `check`, `inspect`, `simulate`
-- GTK4/libadwaita scene backend
-- image loading/export
-- SANE scanning
-- OpenCV quadrilateral/perspective operations
-- OpenAI Responses vision faculty
-- system keyring faculty
+## Faculties
 
-Mora is experimental; the grammar is intentionally small and is evolving alongside real applications such as Scan Slicer Emo.
+Current provider adapters include:
+
+- GTK4/libadwaita scenes and gestures
+- desktop file/form interaction
+- image codecs
+- SANE acquisition
+- OpenCV quadrilateral geometry
+- OpenAI Responses vision
+- system keyring secrets
+
+These are language/platform capabilities, not application implementations.
+
+## Anti-cheat rule
+
+CI scans the runtime source for identifiers and prompt fragments belonging to the reference application. If those leak into `mora/*.py`, the build fails. CI also checks and starts the reference Mora application headlessly, so removing domain knowledge may not break execution.

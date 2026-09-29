@@ -1,373 +1,211 @@
 from __future__ import annotations
-
-import base64
-import io
-import json
-import math
-import os
-import subprocess
-import tempfile
+import base64, io, json, math, os, pathlib, subprocess, tempfile
 from dataclasses import dataclass
-
 from .runtime import MoraError
 
+class MissingSecret(MoraError):
+    def __init__(self, faculty, key, config):
+        self.faculty=faculty; self.key=key; self.config=config
+        super().__init__(f'missing secret {key} for {faculty}')
 
 @dataclass
-class ScannerDevice:
-    id: str
-    label: str
+class Device:
+    id:str; label:str
 
+def _image_load(path):
+    from PIL import Image
+    im=Image.open(path).convert('RGBA'); im.load(); return im
 
-def load_image(path: str):
+def _image_save(image,path):
+    image.save(path,format='PNG'); return path
+
+def _scanner_discover():
+    try:r=subprocess.run(['scanimage','-L'],capture_output=True,text=True,check=False)
+    except FileNotFoundError as e: raise MoraError('SANE scanimage is required') from e
+    if r.returncode!=0:raise MoraError(r.stderr.strip() or 'could not discover devices')
+    out=[]
+    for raw in r.stdout.splitlines():
+        line=raw.strip()
+        if not line.startswith('device '):continue
+        rest=line[7:]; q=rest[0] if rest else ''
+        if q not in "'`":continue
+        end=rest.find("'",1)
+        if end<0:continue
+        ident=rest[1:end].strip(); desc=rest[end+1:].strip()
+        if desc.startswith('is a '):desc=desc[5:]
+        out.append(Device(ident,desc or ident))
+    return out
+
+def _scanner_acquire(device,dpi=600):
+    device_id=device.id if hasattr(device,'id') else str(device)
+    fd,path=tempfile.mkstemp(prefix='mora-',suffix='.png');os.close(fd)
     try:
-        from PIL import Image
-    except ImportError as exc:
-        raise MoraError("image faculty requires Pillow (Arch: python-pillow)") from exc
-    image = Image.open(path).convert("RGBA")
-    image.load()
-    return image
-
-
-def list_scanners() -> list[ScannerDevice]:
-    try:
-        result = subprocess.run(["scanimage", "-L"], capture_output=True, text=True, check=False)
-    except FileNotFoundError as exc:
-        raise MoraError("scanner faculty requires SANE scanimage (Arch: sane)") from exc
-    if result.returncode != 0:
-        raise MoraError(result.stderr.strip() or "could not list scanners")
-    devices: list[ScannerDevice] = []
-    for raw in result.stdout.splitlines():
-        line = raw.strip()
-        if not line.startswith("device "):
-            continue
-        rest = line[len("device "):]
-        if len(rest) < 3 or rest[0] not in {"'", "`"}:
-            continue
-        end = rest.find("'", 1)
-        if end < 0:
-            continue
-        ident = rest[1:end].strip()
-        desc = rest[end + 1:].strip()
-        if desc.startswith("is a "):
-            desc = desc[5:]
-        if ident:
-            devices.append(ScannerDevice(ident, desc or ident))
-    return devices
-
-
-def acquire_scan(device_id: str, dpi: int = 600):
-    fd, path = tempfile.mkstemp(prefix="mora-scan-", suffix=".png")
-    os.close(fd)
-    try:
-        try:
-            result = subprocess.run(
-                [
-                    "scanimage", "-d", device_id, "--format=png", "--mode", "Color",
-                    "--resolution", str(dpi), "-o", path,
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise MoraError("scanner faculty requires SANE scanimage (Arch: sane)") from exc
-        if result.returncode != 0:
-            raise MoraError(result.stderr.strip() or "scanner returned an error")
-        return load_image(path)
+        r=subprocess.run(['scanimage','-d',device_id,'--format=png','--mode','Color','--resolution',str(int(dpi)),'-o',path],capture_output=True,text=True,check=False)
+        if r.returncode!=0:raise MoraError(r.stderr.strip() or 'device acquisition failed')
+        return _image_load(path)
     finally:
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
+        try:os.remove(path)
+        except FileNotFoundError:pass
 
+def _secret_get(app,key):
+    try:r=subprocess.run(['secret-tool','lookup','application',app,'key',key],capture_output=True,text=True,check=False)
+    except FileNotFoundError as e:raise MoraError('libsecret secret-tool is required') from e
+    return r.stdout.strip() or None if r.returncode==0 else None
 
-def keyring_get(application: str, kind: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["secret-tool", "lookup", "application", application, "type", kind],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise MoraError("system-keyring faculty requires secret-tool (Arch: libsecret)") from exc
-    if result.returncode != 0:
-        return None
-    value = result.stdout.strip()
-    return value or None
+def secret_set(app,key,value,label):
+    r=subprocess.run(['secret-tool','store',f'--label={label}','application',app,'key',key],input=value,text=True,capture_output=True,check=False)
+    if r.returncode!=0:raise MoraError(r.stderr.strip() or 'could not store secret')
 
-
-def keyring_set(application: str, kind: str, value: str, label: str):
-    try:
-        result = subprocess.run(
-            [
-                "secret-tool", "store", f"--label={label}",
-                "application", application, "type", kind,
-            ],
-            input=value,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise MoraError("system-keyring faculty requires secret-tool (Arch: libsecret)") from exc
-    if result.returncode != 0:
-        raise MoraError(result.stderr.strip() or "could not store secret")
-
-
-def point_distance(a, b) -> float:
-    return math.hypot(a[0] - b[0], a[1] - b[1])
-
-
-def is_valid_quad(points) -> bool:
-    if len(points) != 4:
-        return False
+def _dist(a,b):return math.hypot(a[0]-b[0],a[1]-b[1])
+def quad_valid(q):
+    if not isinstance(q,(list,tuple)) or len(q)!=4:return False
+    if any(_dist(q[i],q[(i+1)%4])<20 for i in range(4)):return False
+    sign=0
     for i in range(4):
-        if point_distance(points[i], points[(i + 1) % 4]) < 20.0:
-            return False
-    sign = 0.0
-    for i in range(4):
-        a, b, c = points[i], points[(i + 1) % 4], points[(i + 2) % 4]
-        cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
-        if abs(cross) < 1.0:
-            return False
-        current = 1.0 if cross > 0 else -1.0
-        if sign == 0.0:
-            sign = current
-        elif sign != current:
-            return False
+        a,b,c=q[i],q[(i+1)%4],q[(i+2)%4]; cross=(b[0]-a[0])*(c[1]-b[1])-(b[1]-a[1])*(c[0]-b[0])
+        if abs(cross)<1:return False
+        s=1 if cross>0 else -1
+        if not sign:sign=s
+        elif sign!=s:return False
     return True
 
-
-def point_in_quad(point, points) -> bool:
-    pos = neg = False
+def quad_bounds(q):
+    xs=[p[0] for p in q];ys=[p[1] for p in q];return min(xs),min(ys),max(xs),max(ys)
+def point_in_quad(p,q):
+    pos=neg=False
     for i in range(4):
-        a, b = points[i], points[(i + 1) % 4]
-        cross = (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])
-        pos = pos or cross > 0
-        neg = neg or cross < 0
-        if pos and neg:
-            return False
+        a,b=q[i],q[(i+1)%4];c=(b[0]-a[0])*(p[1]-a[1])-(b[1]-a[1])*(p[0]-a[0]);pos|=c>0;neg|=c<0
+        if pos and neg:return False
     return True
 
+def _move(q,dx,dy,image):
+    w,h=image.size;l,t,r,b=quad_bounds(q);dx=max(-l,min(w-r,dx));dy=max(-t,min(h-b,dy));return [[p[0]+dx,p[1]+dy] for p in q]
+def _snap(v,targets,r):
+    cand=[(abs(v-t),t) for t in targets if abs(v-t)<=r];return min(cand)[1] if cand else v
+def _snap_quad(q,image,r):
+    if r<=0:return q
+    w,h=image.size;n=[[_snap(p[0],[0.,float(w)],r),_snap(p[1],[0.,float(h)],r)] for p in q];return n if quad_valid(n) else q
+def _move_corner(q,index,dx,dy,image,snap=0):
+    w,h=image.size;n=[[float(x),float(y)] for x,y in q];n[index]=[max(0,min(w,n[index][0]+dx)),max(0,min(h,n[index][1]+dy))];n=_snap_quad(n,image,snap);return n if quad_valid(n) else q
+def _move_edge(q,index,dx,dy,image,snap=0):
+    pairs=((0,1),(1,2),(2,3),(3,0));a,b=pairs[int(index)];n=[[float(x),float(y)] for x,y in q];p1,p2=n[a],n[b];ex,ey=p2[0]-p1[0],p2[1]-p1[1];length=math.hypot(ex,ey)
+    if length<1:return q
+    nx,ny=-ey/length,ex/length;off=dx*nx+dy*ny;w,h=image.size
+    for i in (a,b):n[i]=[max(0,min(w,n[i][0]+nx*off)),max(0,min(h,n[i][1]+ny*off))]
+    n=_snap_quad(n,image,snap);return n if quad_valid(n) else q
 
-def move_quad(points, dx, dy, image_w, image_h):
-    out = [[float(x), float(y)] for x, y in points]
-    min_x = min(p[0] for p in out)
-    min_y = min(p[1] for p in out)
-    max_x = max(p[0] for p in out)
-    max_y = max(p[1] for p in out)
-    dx = max(-min_x, min(float(image_w) - max_x, dx))
-    dy = max(-min_y, min(float(image_h) - max_y, dy))
-    return [[p[0] + dx, p[1] + dy] for p in out]
+def _centered_quad(image,wf=.33,hf=.33):
+    w,h=image.size;qw=max(100,w*float(wf));qh=max(100,h*float(hf));x=(w-qw)/2;y=(h-qh)/2;return [[x,y],[x+qw,y],[x+qw,y+qh],[x,y+qh]]
+def _expand(q,margin,image):
+    m=float(margin);w,h=image.size
+    if m<=0:return q
+    cx=sum(p[0] for p in q)/4;cy=sum(p[1] for p in q)/4;n=[]
+    for p in q:
+        vx,vy=p[0]-cx,p[1]-cy;l=max(1,math.hypot(vx,vy));n.append([max(0,min(w,p[0]+vx/l*m)),max(0,min(h,p[1]+vy/l*m))])
+    return n if quad_valid(n) else q
+def _expand_each(items,margin,image):return [_expand(q,margin,image) for q in items]
 
+def _filter_quads(items,image,min_side_fraction=.04,min_area=.003,max_area=.80,max_touched_edges=3,edge_fraction=.02):
+    w,h=image.size;scale=min(w,h);out=[]
+    for q in items:
+        if not quad_valid(q):continue
+        l,t,r,b=quad_bounds(q);bw,bh=max(0,r-l),max(0,b-t);area=(bw*bh)/max(1.,float(w*h))
+        if bw<scale*float(min_side_fraction) or bh<scale*float(min_side_fraction):continue
+        if not (float(min_area)<=area<=float(max_area)):continue
+        edge=scale*float(edge_fraction);touched=int(l<=edge)+int(t<=edge)+int(r>=w-edge)+int(b>=h-edge)
+        if touched>=int(max_touched_edges):continue
+        out.append(q)
+    return out
 
-def _snap(value: float, targets: list[float], radius: float) -> float:
-    best = value
-    best_dist = radius + 1.0
-    for target in targets:
-        d = abs(value - target)
-        if d <= radius and d < best_dist:
-            best, best_dist = target, d
-    return best
+def _overlap_ratio(a,b):
+    al,at,ar,ab=quad_bounds(a);bl,bt,br,bb=quad_bounds(b);l,t=max(al,bl),max(at,bt);r,bm=min(ar,br),min(ab,bb)
+    if r<=l or bm<=t:return 0.
+    inter=(r-l)*(bm-t);aa=(ar-al)*(ab-at);ba=(br-bl)*(bb-bt);return inter/max(1.,min(aa,ba))
 
+def _dedupe_quads(items,threshold=.85):
+    out=[]
+    for q in items:
+        if any(_overlap_ratio(q,k)>float(threshold) for k in out):continue
+        out.append(q)
+    return out
 
-def _snap_quad(points, image_w, image_h, radius):
-    if radius <= 0:
-        return points
-    candidate = [
-        [_snap(p[0], [0.0, float(image_w)], radius), _snap(p[1], [0.0, float(image_h)], radius)]
-        for p in points
-    ]
-    return candidate if is_valid_quad(candidate) else points
+def _sort_visual(items,row_height=40):
+    return sorted(items,key=lambda q:(quad_bounds(q)[1]//float(row_height),quad_bounds(q)[0]))
 
+def _crop(image,q):
+    import cv2,numpy as np
+    from PIL import Image
+    w=max(2,int(round(max(_dist(q[0],q[1]),_dist(q[3],q[2])))));h=max(2,int(round(max(_dist(q[0],q[3]),_dist(q[1],q[2])))))
+    src=np.array(q,dtype=np.float32);dst=np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]],dtype=np.float32);mat=cv2.getPerspectiveTransform(src,dst);rgba=np.array(image.convert('RGBA'));out=cv2.warpPerspective(rgba,mat,(w,h),flags=cv2.INTER_CUBIC,borderMode=cv2.BORDER_CONSTANT);return Image.fromarray(out,'RGBA')
 
-def move_corner(points, index, dx, dy, image_w, image_h, snap_radius=0.0):
-    out = [[float(x), float(y)] for x, y in points]
-    out[index][0] = max(0.0, min(float(image_w), out[index][0] + dx))
-    out[index][1] = max(0.0, min(float(image_h), out[index][1] + dy))
-    out = _snap_quad(out, image_w, image_h, snap_radius)
-    return out if is_valid_quad(out) else points
+def _numbered_path(folder,source,index,ext='png'):
+    stem=pathlib.Path(str(source)).stem or 'item';return str(pathlib.Path(folder)/f'{stem}_{int(index):02}.{str(ext).lstrip(".")}')
 
+def _concept_text(node):
+    lines=[];result='text'
+    for _,s in node.statements:
+        if s.startswith('describe '): lines.append(s[len('describe '):].strip().strip('"'))
+        elif s.startswith('result '): result=s[len('result '):].strip()
+        else: lines.append(s)
+    return ' '.join(lines),result
 
-def move_edge(points, a_index, b_index, dx, dy, image_w, image_h, snap_radius=0.0):
-    out = [[float(x), float(y)] for x, y in points]
-    a, b = out[a_index], out[b_index]
-    ex, ey = b[0] - a[0], b[1] - a[1]
-    length = math.hypot(ex, ey)
-    if length < 1.0:
-        return points
-    nx, ny = -ey / length, ex / length
-    offset = dx * nx + dy * ny
-    for i in (a_index, b_index):
-        out[i][0] = max(0.0, min(float(image_w), out[i][0] + nx * offset))
-        out[i][1] = max(0.0, min(float(image_h), out[i][1] + ny * offset))
-    out = _snap_quad(out, image_w, image_h, snap_radius)
-    return out if is_valid_quad(out) else points
+def _vision_perceive(image,concept,model,api_key,detail='high'):
+    import requests
+    from PIL import Image
+    prompt,result=_concept_text(concept)
+    if result!='list of Quad':raise MoraError(f'vision result shape not supported yet: {result}')
+    preview=image.copy();preview.thumbnail((1800,1800),Image.Resampling.LANCZOS);buf=io.BytesIO();preview.convert('RGB').save(buf,format='JPEG',quality=88);url='data:image/jpeg;base64,'+base64.b64encode(buf.getvalue()).decode()
+    point={'type':'object','properties':{'x':{'type':'number','minimum':0,'maximum':1000},'y':{'type':'number','minimum':0,'maximum':1000}},'required':['x','y'],'additionalProperties':False}
+    schema={'type':'object','properties':{'items':{'type':'array','items':{'type':'object','properties':{'corners':{'type':'array','items':point,'minItems':4,'maxItems':4}},'required':['corners'],'additionalProperties':False}}},'required':['items'],'additionalProperties':False}
+    instruction=prompt+' Return each match as exactly four outer corners clockwise, normalized 0..1000 relative to the submitted image.'
+    body={'model':model,'store':False,'max_output_tokens':1500,'input':[{'role':'user','content':[{'type':'input_text','text':instruction},{'type':'input_image','image_url':url,'detail':detail}]}],'text':{'format':{'type':'json_schema','name':'mora_visual_entities','strict':True,'schema':schema}}}
+    r=requests.post('https://api.openai.com/v1/responses',headers={'Authorization':'Bearer '+api_key,'Content-Type':'application/json'},json=body,timeout=45)
+    if not r.ok:
+        try:msg=r.json().get('error',{}).get('message',r.text[:300])
+        except:msg=r.text[:300]
+        raise MoraError(f'vision provider returned {r.status_code}: {msg}')
+    data=r.json();text=data.get('output_text')
+    if text is None:
+        for item in data.get('output',[]):
+            for c in item.get('content',[]):
+                if c.get('type')=='output_text':text=c.get('text');break
+    if text is None:raise MoraError('vision provider returned no structured text')
+    parsed=json.loads(text);w,h=image.size;out=[]
+    for item in parsed.get('items',[]):
+        q=[[max(0,min(1000,float(p['x'])))/1000*w,max(0,min(1000,float(p['y'])))/1000*h] for p in item.get('corners',[])]
+        if quad_valid(q):out.append(q)
+    return out
 
-
-def frame_bounds(points):
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def expand_quad(points, margin, image_w, image_h):
-    if margin <= 0:
-        return points
-    cx = sum(p[0] for p in points) / 4.0
-    cy = sum(p[1] for p in points) / 4.0
-    out = []
-    for p in points:
-        vx, vy = p[0] - cx, p[1] - cy
-        length = max(1.0, math.hypot(vx, vy))
-        out.append([
-            max(0.0, min(float(image_w), p[0] + vx / length * margin)),
-            max(0.0, min(float(image_h), p[1] + vy / length * margin)),
-        ])
-    return out if is_valid_quad(out) else points
-
-
-def perspective_crop(pil_image, points):
-    try:
-        import cv2
-        import numpy as np
-        from PIL import Image
-    except ImportError as exc:
-        raise MoraError("geometry faculty requires OpenCV, NumPy and Pillow") from exc
-    width = max(2, int(round(max(point_distance(points[0], points[1]), point_distance(points[3], points[2])))))
-    height = max(2, int(round(max(point_distance(points[0], points[3]), point_distance(points[1], points[2])))))
-    rgba = np.array(pil_image.convert("RGBA"))
-    src = np.array(points, dtype=np.float32)
-    dst = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype=np.float32)
-    matrix = cv2.getPerspectiveTransform(src, dst)
-    warped = cv2.warpPerspective(rgba, matrix, (width, height), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
-    return Image.fromarray(warped, "RGBA")
-
-
-def detect_photos_openai(pil_image, api_key: str, model: str = "gpt-5.6-terra", margin: int = 0):
-    try:
-        import requests
-    except ImportError as exc:
-        raise MoraError("vision faculty requires requests") from exc
-    try:
-        from PIL import Image
-    except ImportError as exc:
-        raise MoraError("vision faculty requires Pillow") from exc
-
-    preview = pil_image.copy()
-    preview.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
-    buf = io.BytesIO()
-    preview.convert("RGB").save(buf, format="JPEG", quality=88)
-    data_url = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-
-    point_schema = {
-        "type": "object",
-        "properties": {
-            "x": {"type": "number", "minimum": 0, "maximum": 1000},
-            "y": {"type": "number", "minimum": 0, "maximum": 1000},
-        },
-        "required": ["x", "y"],
-        "additionalProperties": False,
-    }
-    schema = {
-        "type": "object",
-        "properties": {
-            "photos": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {"p1": point_schema, "p2": point_schema, "p3": point_schema, "p4": point_schema},
-                    "required": ["p1", "p2", "p3", "p4"],
-                    "additionalProperties": False,
-                },
-            }
-        },
-        "required": ["photos"],
-        "additionalProperties": False,
-    }
-    prompt = (
-        "Detect only the separate physical photographic prints lying on the scanned surface. "
-        "Do not detect people, faces, objects, frames, buildings, trees, or other content inside a photograph. "
-        "Do not return the scanner/page boundary. Include faded, low-contrast, black-and-white, damaged, and slightly rotated prints. "
-        "For every physical print return its four outer corners. Coordinates are normalized 0..1000 relative to the exact submitted image. "
-        "Order points clockwise; p1 is visually closest to top-left. Return no object unless it is itself a physical photo print."
-    )
-    body = {
-        "model": model,
-        "store": False,
-        "max_output_tokens": 1500,
-        "input": [{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_url": data_url, "detail": "high"},
-            ],
-        }],
-        "text": {"format": {"type": "json_schema", "name": "photo_print_layout", "strict": True, "schema": schema}},
-    }
-    response = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=body,
-        timeout=45,
-    )
-    if not response.ok:
-        message = response.text[:500]
-        try:
-            message = response.json().get("error", {}).get("message", message)
-        except Exception:
-            pass
-        raise MoraError(f"OpenAI API returned {response.status_code}: {message}")
-    payload = response.json()
-    output_text = payload.get("output_text")
-    if output_text is None:
-        for item in payload.get("output", []):
-            for item_content in item.get("content", []):
-                if item_content.get("type") == "output_text":
-                    output_text = item_content.get("text")
-                    break
-    if output_text is None:
-        raise MoraError("OpenAI response did not contain output_text")
-    layout = json.loads(output_text)
-    width, height = pil_image.size
-    frames = []
-    for photo in layout.get("photos", []):
-        points = []
-        for key in ("p1", "p2", "p3", "p4"):
-            p = photo[key]
-            points.append([
-                max(0.0, min(1000.0, float(p["x"]))) / 1000.0 * width,
-                max(0.0, min(1000.0, float(p["y"]))) / 1000.0 * height,
-            ])
-        left, top, right, bottom = frame_bounds(points)
-        bw, bh = right - left, bottom - top
-        area = (bw * bh) / max(1.0, float(width * height))
-        if bw < min(width, height) * 0.04 or bh < min(width, height) * 0.04 or not (0.003 <= area <= 0.80):
-            continue
-        edge = min(width, height) * 0.02
-        touched = int(left <= edge) + int(top <= edge) + int(right >= width - edge) + int(bottom >= height - edge)
-        if touched >= 3:
-            continue
-        frames.append({"corners": expand_quad(points, margin, width, height)})
-
-    frames.sort(key=lambda frame: (frame_bounds(frame["corners"])[1] // 40, frame_bounds(frame["corners"])[0]))
-    kept = []
-    for frame in frames:
-        duplicate = False
-        a = frame_bounds(frame["corners"])
-        for other in kept:
-            b = frame_bounds(other["corners"])
-            left, top = max(a[0], b[0]), max(a[1], b[1])
-            right, bottom = min(a[2], b[2]), min(a[3], b[3])
-            if right <= left or bottom <= top:
-                continue
-            inter = (right - left) * (bottom - top)
-            area_a = (a[2] - a[0]) * (a[3] - a[1])
-            area_b = (b[2] - b[0]) * (b[3] - b[1])
-            if inter / max(1.0, min(area_a, area_b)) > 0.85:
-                duplicate = True
-                break
-        if not duplicate:
-            kept.append(frame)
-    return kept
+class Registry:
+    def __init__(self,program,app_id):
+        self.program=program;self.app_id=app_id;self.faculties={}
+        for n in program.declarations('faculty'):
+            m=n.header.split(' from ',1)
+            if len(m)!=2:continue
+            alias=m[0].split(None,1)[1].strip();provider=m[1].strip();cfg={}
+            for _,s in n.statements:
+                if s.startswith('model '):cfg['model']=s[6:].strip().strip('"')
+                elif s.startswith('secret '):
+                    p=s.split();cfg['secret_key']=p[1]
+                elif s.startswith('secret-label '):cfg['secret_label']=s[len('secret-label '):].strip().strip('"')
+                elif s.startswith('secret-help '):cfg['secret_help']=s[len('secret-help '):].strip().strip('"')
+                elif s.startswith('secret-link '):cfg['secret_link']=s[len('secret-link '):].strip().strip('"')
+            self.faculties[alias]=(provider,cfg)
+    def provider(self,alias):return self.faculties[alias][0]
+    def config(self,alias):return self.faculties[alias][1]
+    def invoke(self,alias,operation,args,options=None):
+        if alias not in self.faculties:raise MoraError(f'unknown faculty {alias}')
+        provider,cfg=self.faculties[alias];options=options or {}
+        if provider=='image-codec':
+            return {'load':_image_load,'save':_image_save}[operation](*args)
+        if provider=='sane':return {'discover':_scanner_discover,'acquire':_scanner_acquire}[operation](*args)
+        if provider=='opencv':
+            table={'centered-quad':_centered_quad,'expand-each':_expand_each,'perspective-crop':_crop,'move':_move,'move-corner':_move_corner,'move-edge':_move_edge,'bounds':quad_bounds,'contains':point_in_quad,'filter':_filter_quads,'dedupe':_dedupe_quads,'sort-visual':_sort_visual}
+            return table[operation](*args)
+        if provider=='desktop.files' and operation=='numbered-path':return _numbered_path(*args)
+        if provider=='openai.responses' and operation=='perceive':
+            key=cfg.get('secret_key');secret=_secret_get(self.app_id,key) if key else None
+            if key and not secret:raise MissingSecret(alias,key,cfg)
+            image,concept=args[:2];detail=options.get('detail','high')
+            return _vision_perceive(image,concept,cfg.get('model','gpt-5.6-terra'),secret,detail)
+        raise MoraError(f'provider {provider} does not implement {operation}')

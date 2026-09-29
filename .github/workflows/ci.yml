@@ -11,26 +11,32 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compile runtime
         run: python3 -m py_compile mora/*.py
+      - name: Reject application leakage
+        run: |
+          if grep -RniE 'ScanSlicer|Scan Slicer|PhysicalPhoto|DetectRegions|OpenImage|AcquireImage|AddRegion|DeleteRegion|ExportRegions|physical photographic prints|photo print' mora; then
+            echo "Application-specific code leaked into the Mora runtime"
+            exit 1
+          fi
       - name: Install Mora
         run: python3 -m pip install --no-deps --no-build-isolation .
-      - name: Check Scan Slicer Emo
+      - name: Check reference Mora application
         run: |
-          git clone --depth 1 https://github.com/ziacik/scan-slicer-emo.git
-          mora check scan-slicer-emo/app.mora
-          mora simulate scan-slicer-emo/app.mora 'correction(A)' 'correction(A)' 'correction(A)'
-      - name: Runtime smoke tests
+          git clone --depth 1 https://github.com/ziacik/scan-slicer-emo.git reference-app
+          mora check reference-app/app.mora
+          mora simulate reference-app/app.mora 'correction(A)' 'correction(A)' 'correction(A)'
+      - name: Generic runtime smoke tests
         run: |
           python3 - <<'PY'
           from mora.gtk_backend import BUTTON_RE
-          from mora import faculties
-          assert BUTTON_RE.match('button Delete invites DeleteFrame when selection exists')
+          from mora.faculties import quad_valid, point_in_quad
+          assert BUTTON_RE.match('button Remove invites RemoveThing when focus exists')
           q=[[10.,10.],[110.,10.],[110.,90.],[10.,90.]]
-          assert faculties.is_valid_quad(q)
-          assert faculties.move_corner(q,0,5,7,200,200)[0] == [15.0,17.0]
-          print('runtime smoke tests: OK')
+          assert quad_valid(q)
+          assert point_in_quad([50,50], q)
+          print('generic runtime smoke tests: OK')
           PY
 
-  gtk-import:
+  gtk:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,26 +44,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-pil python3-requests python3-opencv xvfb dbus-x11
-      - name: Import GTK backend
+      - name: Compile and import GTK backend
         run: /usr/bin/python3 -m py_compile mora/*.py
-      - name: Verify GI
+      - name: Start reference Mora scene
         run: |
-          /usr/bin/python3 - <<'PY'
-          import gi
-          gi.require_version('Gtk','4.0')
-          gi.require_version('Adw','1')
-          from gi.repository import Gtk, Adw
-          print('GTK/Adwaita import: OK')
-          PY
-      - name: Start Scan Slicer Emo scene
-        run: |
-          git clone --depth 1 https://github.com/ziacik/scan-slicer-emo.git
+          git clone --depth 1 https://github.com/ziacik/scan-slicer-emo.git reference-app
           set +e
-          timeout 5s dbus-run-session -- xvfb-run -a /usr/bin/python3 mora.py run scan-slicer-emo/app.mora
+          timeout 5s dbus-run-session -- xvfb-run -a /usr/bin/python3 mora.py run reference-app/app.mora
           code=$?
           set -e
           if [ "$code" -ne 124 ]; then
-            echo "Mora GTK app exited unexpectedly with code $code"
+            echo "Mora GTK application exited unexpectedly with code $code"
             exit "$code"
           fi
           echo "Mora GTK scene stayed alive: OK"

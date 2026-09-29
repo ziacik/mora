@@ -35,10 +35,15 @@ jobs:
           python3 - <<'PY'
           from mora.gtk_backend import BUTTON_RE
           from mora.faculties import quad_valid, point_in_quad
+          from mora.execution import Engine
           assert BUTTON_RE.match('button Remove invites RemoveThing when focus exists')
           q=[[10.,10.],[110.,10.],[110.,90.],[10.,90.]]
           assert quad_valid(q)
           assert point_in_quad([50,50], q)
+          e=Engine.__new__(Engine); e.world={'flag':False}
+          assert e.condition('flag') is False
+          e.world['flag']=True
+          assert e.condition('flag') is True
           print('generic runtime smoke tests: OK')
           PY
 

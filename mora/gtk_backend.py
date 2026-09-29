@@ -16,7 +16,7 @@ class UI:
 class GtkBackend:
     def __init__(self,program):
         self.program=program;self._load_gtk();self.app_id=self._identity() or 'org.mora.Application';self.registry=Registry(program,self.app_id);self.engine=Engine(program,self.registry);self.engine.on_change=self.refresh;self.engine.on_message=self._message
-        self.ui=UI();self.canvas={};self.drag=None;self.hover=(0.,0.);self.preview=None;self.preview_ratio=1.0
+        self.ui=UI();self.canvas={};self.drag=None;self.hover=(0.,0.);self.preview=None;self.preview_ratio=1.0;self._keys=set();self._timers=[]
     def _load_gtk(self):
         try:
             import gi
@@ -41,11 +41,12 @@ class GtkBackend:
         window=self.Adw.ApplicationWindow(application=app,title=title,default_width=w,default_height=h);window.set_size_request(mw,mh);self.ui.window=window
         header=self.Adw.HeaderBar();header.set_title_widget(self.Adw.WindowTitle(title=title,subtitle='Mora application'))
         if n:=win.child('header'):self._header(header,n)
-        side=self._sidebar(win.child('sidebar'))
-        canvas=self._canvas(next((c for c in win.children if c.kind=='canvas'),None))
-        paned=self.Gtk.Paned(orientation=self.Gtk.Orientation.HORIZONTAL);paned.set_start_child(side);paned.set_end_child(canvas);paned.set_position(310);paned.set_resize_start_child(False)
-        toast=self.Adw.ToastOverlay();toast.set_child(paned);self.ui.toast=toast
-        toolbar=self.Adw.ToolbarView();toolbar.add_top_bar(header);toolbar.set_content(toast);window.set_content(toolbar);self._css();self.refresh();window.present()
+        side_node=win.child('sidebar');canvas=self._canvas(next((c for c in win.children if c.kind=='canvas'),None))
+        content=canvas
+        if side_node:
+            side=self._sidebar(side_node);paned=self.Gtk.Paned(orientation=self.Gtk.Orientation.HORIZONTAL);paned.set_start_child(side);paned.set_end_child(canvas);paned.set_position(310);paned.set_resize_start_child(False);content=paned
+        toast=self.Adw.ToastOverlay();toast.set_child(content);self.ui.toast=toast
+        toolbar=self.Adw.ToolbarView();toolbar.add_top_bar(header);toolbar.set_content(toast);window.set_content(toolbar);self._css();self._install_keyboard(window,win.child('keyboard'));self._install_clock(win.child('clock'));self.refresh();window.present()
     def _button_spec(self,s):
         m=BUTTON_RE.match(s)
         if not m:return None
@@ -86,7 +87,7 @@ class GtkBackend:
         row=self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL,spacing=8);row.set_valign(self.Gtk.Align.END);row.set_vexpand(True);self.ui.spinner=self.Gtk.Spinner();self.ui.spinner.set_visible(False);self.ui.status=self.Gtk.Label(label='');self.ui.status.set_wrap(True);self.ui.status.set_xalign(0);row.append(self.ui.spinner);row.append(self.ui.status);side.append(row);return side
     def _canvas(self,node):
         d=self.Gtk.DrawingArea();d.set_hexpand(True);d.set_vexpand(True);d.set_focusable(True);d.add_css_class('mora-canvas');d.set_draw_func(self._draw);self.ui.drawing=d
-        self.canvas={'image':None,'shapes':None,'focus':None,'view':None,'adapt':None,'gestures':{}}
+        self.canvas={'image':None,'shapes':None,'focus':None,'view':None,'adapt':None,'gestures':{},'coordinates':None,'background':None,'foreground':None,'primitives':[]}
         if node:
             for _,s in node.statements:
                 p=s.split()
@@ -96,8 +97,12 @@ class GtkBackend:
                 elif p[0]=='focus':self.canvas['focus']=p[1]
                 elif p[0]=='view':self.canvas['view']=p[1]
                 elif p[0]=='adapt' and len(p)>=3:self.canvas['adapt']=p[2]
+                elif p[0]=='coordinates' and len(p)>=4 and p[2]=='x':self.canvas['coordinates']=(float(p[1]),float(p[3]))
+                elif p[0]=='background' and len(p)>=2:self.canvas['background']=p[1].strip('"')
+                elif p[0]=='foreground' and len(p)>=2:self.canvas['foreground']=p[1].strip('"')
             for c in node.children:
                 if c.header.startswith('gesture '):self.canvas['gestures'][c.header[8:]]=c
+                elif c.kind in {'rectangle','circle','line','text'}:self.canvas['primitives'].append(c)
         motion=self.Gtk.EventControllerMotion();motion.connect('motion',self._motion);d.add_controller(motion)
         drag=self.Gtk.GestureDrag();drag.set_button(1);drag.connect('drag-begin',self._drag_begin);drag.connect('drag-update',self._drag_update);drag.connect('drag-end',self._drag_end);d.add_controller(drag)
         scroll=self.Gtk.EventControllerScroll.new(self.Gtk.EventControllerScrollFlags.VERTICAL);scroll.connect('scroll',self._scroll);d.add_controller(scroll)
@@ -112,6 +117,31 @@ class GtkBackend:
                         elif m:=ACTION_RE.match(s):
                             b=self.Gtk.Button(label=m.group(1));b.connect('clicked',lambda _b,d=m.group(2):self.invoke(d));actions.append(b)
         empty.set_child(actions);self.ui.empty=empty;over=self.Gtk.Overlay();over.set_child(d);over.add_overlay(empty);return over
+    def _install_keyboard(self,window,node):
+        if not node:return
+        bindings={}
+        for _,s in node.statements:
+            m=re.match(r'key\s+"?([^"\s]+)"?\s+(pressed|released)\s+invites\s+(\w+)',s)
+            if m:bindings[(m.group(1).lower(),m.group(2))]=m.group(3)
+        if not bindings:return
+        ctrl=self.Gtk.EventControllerKey()
+        def pressed(_c,keyval,_keycode,_state):
+            name=(self.Gdk.keyval_name(keyval) or '').lower()
+            if name in self._keys:return False
+            self._keys.add(name);desire=bindings.get((name,'pressed'))
+            if desire:self.invoke(desire)
+            return bool(desire)
+        def released(_c,keyval,_keycode,_state):
+            name=(self.Gdk.keyval_name(keyval) or '').lower();self._keys.discard(name);desire=bindings.get((name,'released'))
+            if desire:self.invoke(desire)
+        ctrl.connect('key-pressed',pressed);ctrl.connect('key-released',released);window.add_controller(ctrl)
+    def _install_clock(self,node):
+        if not node:return
+        for _,s in node.statements:
+            m=re.match(r'every\s+([0-9.]+)(ms|s)\s+invites\s+(\w+)',s)
+            if not m:continue
+            value,unit,desire=m.groups();ms=max(1,int(float(value)*(1000 if unit=='s' else 1)))
+            ident=self.GLib.timeout_add(ms,lambda d=desire:(self.invoke(d),True)[1]);self._timers.append(ident)
     def _css(self):
         p=self.Gtk.CssProvider();p.load_from_string('.mora-canvas { background: @view_bg_color; }');disp=self.Gdk.Display.get_default()
         if disp:self.Gtk.StyleContext.add_provider_for_display(disp,p,self.Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -127,6 +157,9 @@ class GtkBackend:
         provider=self.registry.provider(req.faculty)
         if provider=='desktop.files':return self._files_request(req,g)
         if provider=='desktop.forms':return self._form_request(req,g)
+        if not self.registry.is_async(req.faculty):
+            try:return self._drive(g,self.registry.invoke(req.faculty,req.operation,req.args,req.options))
+            except Exception as e:return self._drive(g,None,e)
         def work():
             try:return self.registry.invoke(req.faculty,req.operation,req.args,req.options),None
             except Exception as e:return None,e
@@ -246,7 +279,50 @@ class GtkBackend:
         ip=self._image_point((x,y),t)
         for i in range(len(shapes)-1,-1,-1):
             if point_in_quad(ip,shapes[i]):return i,'shape',None
+    def _color(self,text,default):
+        if not text:return default
+        s=str(text).strip()
+        if s.startswith('#') and len(s) in (7,9):
+            try:
+                vals=[int(s[i:i+2],16)/255 for i in range(1,len(s),2)]
+                return tuple(vals[:3]+([vals[3]] if len(vals)>3 else [1.]))
+            except:pass
+        return default
+    def _scene_value(self,token):
+        token=str(token).strip()
+        if token.startswith('"') and token.endswith('"'):return token[1:-1]
+        root=token.split('.')[0]
+        if root in self.engine.world:return self.engine.get(token)
+        try:return float(token)
+        except:return token
+    def _primitive_props(self,node):
+        out={}
+        for _,s in node.statements:
+            p=s.split(None,1)
+            if p:out[p[0]]=self._scene_value(p[1]) if len(p)>1 else True
+        return out
+    def _world_transform(self,w,h):
+        dims=self.canvas.get('coordinates')
+        if not dims:return (1.,0.,0.)
+        cw,ch=dims;scale=min(max(1,w)/cw,max(1,h)/ch);return scale,(w-cw*scale)/2,(h-ch*scale)/2
+    def _draw_primitives(self,cr,w,h):
+        if not self.canvas.get('primitives'):return
+        scale,ox,oy=self._world_transform(w,h);bg=self._color(self.canvas.get('background'),(.06,.06,.07,1));fg=self._color(self.canvas.get('foreground'),(.95,.95,.95,1))
+        cr.save();cr.set_source_rgba(*bg);cr.paint();cr.translate(ox,oy);cr.scale(scale,scale)
+        for node in self.canvas['primitives']:
+            p=self._primitive_props(node);cr.set_source_rgba(*fg)
+            if node.kind=='rectangle':
+                cr.rectangle(float(p.get('x',0)),float(p.get('y',0)),float(p.get('width',1)),float(p.get('height',1)));cr.fill()
+            elif node.kind=='circle':
+                cr.arc(float(p.get('x',0)),float(p.get('y',0)),float(p.get('radius',1)),0,math.tau);cr.fill()
+            elif node.kind=='line':
+                if p.get('dashed'):cr.set_dash([8,10])
+                cr.set_line_width(float(p.get('width',2)));cr.move_to(float(p.get('x1',0)),float(p.get('y1',0)));cr.line_to(float(p.get('x2',0)),float(p.get('y2',0)));cr.stroke();cr.set_dash([])
+            elif node.kind=='text':
+                cr.select_font_face('Sans');cr.set_font_size(float(p.get('size',24)));cr.move_to(float(p.get('x',0)),float(p.get('y',0)));cr.show_text(str(p.get('value','')))
+        cr.restore()
     def _draw(self,_a,cr,w,h):
+        self._draw_primitives(cr,w,h)
         if not self.preview:return
         t=self._transform(w,h);cr.save();cr.translate(t['x'],t['y']);cr.scale(t['scale'],t['scale']);self.Gdk.cairo_set_source_pixbuf(cr,self.preview,0,0);cr.paint();cr.restore();focus=self._focus();handle,_,mag=self._assist()
         for i,q in enumerate(self._shapes()):

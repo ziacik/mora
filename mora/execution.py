@@ -65,7 +65,9 @@ class Engine:
         if t.endswith(' not empty'):return bool(self.get(t[:-10].strip(),env))
         if t.startswith('not '):return not self.condition(t[4:],env)
         root=t.split('.')[0]
-        if root in env or root in self.world:return self.get(t,env) is not None
+        if root in env or root in self.world:
+            value=self.get(t,env)
+            return value if isinstance(value,bool) else value is not None
         return False
     def _options(self,node,env):
         out={}

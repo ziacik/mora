@@ -20,6 +20,7 @@ class GtkBackend:
     def _load_gtk(self):
         try:
             import gi
+            gi.require_foreign('cairo')
             for n,v in [('Gtk','4.0'),('Adw','1'),('Gdk','4.0'),('GdkPixbuf','2.0')]:gi.require_version(n,v)
             from gi.repository import Gtk,Adw,Gdk,GdkPixbuf,GLib
         except Exception as e:raise MoraError('GTK4/libadwaita faculty unavailable') from e

@@ -37,7 +37,7 @@ jobs:
       - name: Install GTK runtime
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-pil python3-requests python3-opencv
+          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-pil python3-requests python3-opencv xvfb dbus-x11
       - name: Import GTK backend
         run: /usr/bin/python3 -m py_compile mora/*.py
       - name: Verify GI
@@ -49,3 +49,15 @@ jobs:
           from gi.repository import Gtk, Adw
           print('GTK/Adwaita import: OK')
           PY
+      - name: Start Scan Slicer Emo scene
+        run: |
+          git clone --depth 1 https://github.com/ziacik/scan-slicer-emo.git
+          set +e
+          timeout 5s dbus-run-session -- xvfb-run -a /usr/bin/python3 mora.py run scan-slicer-emo/app.mora
+          code=$?
+          set -e
+          if [ "$code" -ne 124 ]; then
+            echo "Mora GTK app exited unexpectedly with code $code"
+            exit "$code"
+          fi
+          echo "Mora GTK scene stayed alive: OK"

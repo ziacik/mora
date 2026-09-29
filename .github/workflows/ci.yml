@@ -52,8 +52,10 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/ziacik/scan-slicer-emo.git reference-app
           set +e
-          timeout 5s dbus-run-session -- xvfb-run -a /usr/bin/python3 mora.py run reference-app/app.mora
+          timeout 5s dbus-run-session -- xvfb-run -a /usr/bin/python3 mora.py run reference-app/app.mora > /tmp/mora-gtk-1.log 2>&1
           code=$?
+          cat /tmp/mora-gtk-1.log
+          if grep -E 'Traceback|TypeError|Mora error' /tmp/mora-gtk-1.log; then exit 1; fi
           set -e
           if [ "$code" -ne 124 ]; then
             echo "Mora GTK application exited unexpectedly with code $code"
@@ -62,8 +64,10 @@ jobs:
           echo "Mora GTK scene stayed alive: OK"
           git clone --depth 1 https://github.com/ziacik/mora-pong.git second-app
           set +e
-          timeout 5s dbus-run-session -- xvfb-run -a /usr/bin/python3 mora.py run second-app/app.mora
+          timeout 5s dbus-run-session -- xvfb-run -a /usr/bin/python3 mora.py run second-app/app.mora > /tmp/mora-gtk-2.log 2>&1
           code=$?
+          cat /tmp/mora-gtk-2.log
+          if grep -E 'Traceback|TypeError|Mora error' /tmp/mora-gtk-2.log; then exit 1; fi
           set -e
           if [ "$code" -ne 124 ]; then
             echo "Second Mora GTK application exited unexpectedly with code $code"

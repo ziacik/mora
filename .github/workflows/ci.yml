@@ -37,7 +37,7 @@ jobs:
       - name: Install GTK runtime
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-pil python3-requests python3-cv2
+          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-pil python3-requests python3-opencv
       - name: Import GTK backend
         run: /usr/bin/python3 -m py_compile mora/*.py
       - name: Verify GI

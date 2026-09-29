@@ -1,4 +1,4 @@
-# Mora 0.4
+# Mora 0.4.1
 
 Mora is an experimental affective programming language. Applications describe beliefs, evidence, desires, journeys, laws, offers, scenes, and calls to generic faculties.
 
@@ -41,7 +41,8 @@ Vision is also generic. A program supplies its own concept and desired result sh
 
 Current provider adapters include:
 
-- GTK4/libadwaita scenes and gestures
+- GTK4/libadwaita scenes, gestures, keyboard input, periodic clocks, and 2D canvas primitives
+- generic arithmetic and 2D motion/collision operations
 - desktop file/form interaction
 - image codecs
 - SANE acquisition
@@ -56,3 +57,20 @@ These are language/platform capabilities, not application implementations.
 CI scans the runtime source for identifiers and prompt fragments belonging to the reference application. If those leak into `mora/*.py`, the build fails. CI also checks and starts the reference Mora application headlessly, so removing domain knowledge may not break execution.
 
 Reference application compatibility is checked against its current `main` branch in CI.
+
+## Interactive scenes
+
+GTK scenes may bind key press/release events to desires and may invite a desire periodically:
+
+```mora
+keyboard {
+    key w pressed invites MoveUp
+    key w released invites StopMoving
+}
+
+clock {
+    every 16ms invites AdvanceWorld
+}
+```
+
+A canvas may also declare generic `rectangle`, `circle`, `line`, and `text` primitives bound to remembered values. These mechanisms contain no application rules; applications define their own state transitions in Mora desires.

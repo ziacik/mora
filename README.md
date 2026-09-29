@@ -54,3 +54,5 @@ These are language/platform capabilities, not application implementations.
 ## Anti-cheat rule
 
 CI scans the runtime source for identifiers and prompt fragments belonging to the reference application. If those leak into `mora/*.py`, the build fails. CI also checks and starts the reference Mora application headlessly, so removing domain knowledge may not break execution.
+
+Reference application compatibility is checked against its current `main` branch in CI.

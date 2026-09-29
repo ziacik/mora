@@ -13,7 +13,7 @@ jobs:
         run: python3 -m py_compile mora/*.py
       - name: Reject application leakage
         run: |
-          if grep -RniE 'ScanSlicer|Scan Slicer|PhysicalPhoto|DetectRegions|OpenImage|AcquireImage|AddRegion|DeleteRegion|ExportRegions|physical photographic prints|photo print' mora; then
+          if grep -RniE 'ScanSlicer|Scan Slicer|PhysicalPhoto|DetectRegions|OpenImage|AcquireImage|AddRegion|DeleteRegion|ExportRegions|physical photographic prints|photo print|MoraPong|Pong|paddle|ball|score|LeftUpPressed|ServeLeft' mora; then
             echo "Application-specific code leaked into the Mora runtime"
             exit 1
           fi
@@ -24,6 +24,8 @@ jobs:
           git clone --depth 1 https://github.com/ziacik/scan-slicer-emo.git reference-app
           mora check reference-app/app.mora
           mora simulate reference-app/app.mora 'correction(A)' 'correction(A)' 'correction(A)'
+          git clone --depth 1 https://github.com/ziacik/mora-pong.git second-app
+          mora check second-app/app.mora
       - name: Generic runtime smoke tests
         run: |
           python3 - <<'PY'
@@ -58,3 +60,13 @@ jobs:
             exit "$code"
           fi
           echo "Mora GTK scene stayed alive: OK"
+          git clone --depth 1 https://github.com/ziacik/mora-pong.git second-app
+          set +e
+          timeout 5s dbus-run-session -- xvfb-run -a /usr/bin/python3 mora.py run second-app/app.mora
+          code=$?
+          set -e
+          if [ "$code" -ne 124 ]; then
+            echo "Second Mora GTK application exited unexpectedly with code $code"
+            exit "$code"
+          fi
+          echo "Second Mora GTK scene stayed alive: OK"

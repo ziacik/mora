@@ -7,7 +7,7 @@ The runtime must not know an application's domain. In Mora 0.4, desires are exec
 ## Install on Arch / Manjaro
 
 ```bash
-sudo pacman -S python python-gobject gtk4 libadwaita python-pillow python-opencv python-requests sane libsecret
+sudo pacman -S python python-gobject python-cairo gtk4 libadwaita python-pillow python-opencv python-requests sane libsecret
 sh install.sh
 ```
 

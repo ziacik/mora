@@ -1,424 +1,304 @@
 from __future__ import annotations
+import copy,io,math,re,threading
+from dataclasses import dataclass,field
+from .runtime import MoraError
+from .execution import Engine,Request
+from .faculties import Registry,MissingSecret,quad_bounds,point_in_quad
 
-import copy, io, math, os, pathlib, re, threading
-from dataclasses import dataclass, field
-from typing import Any, Callable
-from . import faculties
-from .runtime import AffectiveRuntime, MoraError, Node, Program
-
-BUTTON_RE = re.compile(r'^button\s+(?P<label>"[^"]+"|\S+)(?:\s+icon\s+(?P<icon>[\w-]+))?(?:\s+(?P<emph>emphasized))?\s+invites\s+(?P<desire>[A-Za-z_][\w]*)(?:\s+when\s+.+)?$')
-ACTION_RE = re.compile(r'^action\s+"([^"]+)"\s+invites\s+([A-Za-z_][\w]*)$')
+BUTTON_RE=re.compile(r'^button\s+(?P<label>"[^"]+"|\S+)(?:\s+icon\s+(?P<icon>[\w-]+))?(?:\s+(?P<emph>emphasized))?\s+invites\s+(?P<desire>\w+)(?:\s+when\s+(?P<when>.+))?$')
+ACTION_RE=re.compile(r'^action\s+"([^"]+)"\s+invites\s+(\w+)$')
 
 @dataclass
 class UI:
-    window: Any = None
-    drawing: Any = None
-    empty: Any = None
-    source: Any = None
-    frames: Any = None
-    selected: Any = None
-    assist: Any = None
-    zoom: Any = None
-    padding: Any = None
-    spinner: Any = None
-    status: Any = None
-    toast: Any = None
-    buttons: dict[str, Any] = field(default_factory=dict)
+    window:object=None;drawing:object=None;empty:object=None;status:object=None;spinner:object=None;toast:object=None
+    buttons:dict=field(default_factory=dict);bindings:list=field(default_factory=list);numbers:list=field(default_factory=list)
 
 class GtkBackend:
-    def __init__(self, program: Program):
-        self.program, self.ui = program, UI()
-        self.affect = AffectiveRuntime(program)
-        self.affect.on_desire, self.affect.on_change = self.invoke_desire, self.refresh
-        self._gtk()
-        self.state = {
-            "scan": None, "frames": [], "selection": None,
-            "history": {"past": [], "future": []},
-            "padding": 0, "view": {"zoom": 1.0, "x": 0.0, "y": 0.0},
-            "message": "Open an image or scan one to begin.", "busy": False,
-            "preview": None, "preview_ratio": 1.0, "drag": None, "hover": (0.0, 0.0),
-        }
-        self.app_id = self._identity() or "com.github.mora.Application"
-        self.model = self._vision_model() or "gpt-5.6-terra"
-
-    def _gtk(self):
+    def __init__(self,program):
+        self.program=program;self._load_gtk();self.app_id=self._identity() or 'org.mora.Application';self.registry=Registry(program,self.app_id);self.engine=Engine(program,self.registry);self.engine.on_change=self.refresh;self.engine.on_message=self._message
+        self.ui=UI();self.canvas={};self.drag=None;self.hover=(0.,0.);self.preview=None;self.preview_ratio=1.0
+    def _load_gtk(self):
         try:
             import gi
-            for name, ver in (("Gtk","4.0"),("Adw","1"),("Gdk","4.0"),("GdkPixbuf","2.0")):
-                gi.require_version(name, ver)
-            from gi.repository import Adw, Gdk, GdkPixbuf, GLib, Gtk
-        except Exception as exc:
-            raise MoraError("GTK faculty unavailable. On Arch/Manjaro: sudo pacman -S python-gobject gtk4 libadwaita") from exc
-        self.Adw, self.Gdk, self.GdkPixbuf, self.GLib, self.Gtk = Adw, Gdk, GdkPixbuf, GLib, Gtk
-
+            for n,v in [('Gtk','4.0'),('Adw','1'),('Gdk','4.0'),('GdkPixbuf','2.0')]:gi.require_version(n,v)
+            from gi.repository import Gtk,Adw,Gdk,GdkPixbuf,GLib
+        except Exception as e:raise MoraError('GTK4/libadwaita faculty unavailable') from e
+        self.Gtk,self.Adw,self.Gdk,self.GdkPixbuf,self.GLib=Gtk,Adw,Gdk,GdkPixbuf,GLib
     def _identity(self):
-        apps = self.program.declarations("app")
-        for _, s in apps[0].statements if apps else []:
-            m = re.match(r'identity\s+"([^"]+)"', s)
-            if m: return m.group(1)
-
-    def _vision_model(self):
-        for n in self.program.declarations("faculty"):
-            if n.name.startswith("vision "):
-                for _, s in n.statements:
-                    m = re.match(r'model\s+"([^"]+)"', s)
-                    if m: return m.group(1)
-
+        apps=self.program.declarations('app')
+        if not apps:return None
+        for _,s in apps[0].statements:
+            m=re.match(r'identity\s+"([^"]+)"',s)
+            if m:return m.group(1)
     def run(self):
-        app = self.Adw.Application(application_id=self.app_id)
-        app.connect("activate", self._activate)
-        app.run([])
-
-    def _activate(self, app):
-        scene = self.program.declaration("scene","Main") or self.program.declarations("scene")[0]
-        win = scene.child("window")
-        if not win: raise MoraError("scene requires a window")
-        title, w, h, mw, mh = "Mora", 1100, 760, 640, 480
-        for _, s in win.statements:
-            if m:=re.match(r'title\s+"([^"]+)"',s): title=m.group(1)
-            if m:=re.match(r'size\s+(\d+)\s+x\s+(\d+)',s): w,h=map(int,m.groups())
-            if m:=re.match(r'minimum\s+(\d+)\s+x\s+(\d+)',s): mw,mh=map(int,m.groups())
-        window=self.Adw.ApplicationWindow(application=app,title=title,default_width=w,default_height=h)
-        window.set_size_request(mw,mh); self.ui.window=window
-        header=self.Adw.HeaderBar(); header.set_title_widget(self.Adw.WindowTitle(title=title,subtitle="Affective photo sheet editor"))
-        if n:=win.child("header"): self._header(header,n)
-        sidebar=self._sidebar(win.child("sidebar"))
-        canvas=self._canvas(next((c for c in win.children if c.kind=="canvas"),None))
-        paned=self.Gtk.Paned(orientation=self.Gtk.Orientation.HORIZONTAL)
-        paned.set_start_child(sidebar); paned.set_end_child(canvas); paned.set_position(310); paned.set_resize_start_child(False)
-        toast=self.Adw.ToastOverlay(); toast.set_child(paned); self.ui.toast=toast
-        toolbar=self.Adw.ToolbarView(); toolbar.add_top_bar(header); toolbar.set_content(toast); window.set_content(toolbar)
-        self._css(); self.refresh(); window.present()
-
+        app=self.Adw.Application(application_id=self.app_id);app.connect('activate',self._activate);app.run([])
+    def _activate(self,app):
+        scene=self.program.declarations('scene')[0];win=scene.child('window');title='Mora';w,h=1100,760;mw,mh=640,480
+        for _,s in win.statements:
+            if m:=re.match(r'title\s+"([^"]+)"',s):title=m.group(1)
+            if m:=re.match(r'size\s+(\d+)\s+x\s+(\d+)',s):w,h=map(int,m.groups())
+            if m:=re.match(r'minimum\s+(\d+)\s+x\s+(\d+)',s):mw,mh=map(int,m.groups())
+        window=self.Adw.ApplicationWindow(application=app,title=title,default_width=w,default_height=h);window.set_size_request(mw,mh);self.ui.window=window
+        header=self.Adw.HeaderBar();header.set_title_widget(self.Adw.WindowTitle(title=title,subtitle='Mora application'))
+        if n:=win.child('header'):self._header(header,n)
+        side=self._sidebar(win.child('sidebar'))
+        canvas=self._canvas(next((c for c in win.children if c.kind=='canvas'),None))
+        paned=self.Gtk.Paned(orientation=self.Gtk.Orientation.HORIZONTAL);paned.set_start_child(side);paned.set_end_child(canvas);paned.set_position(310);paned.set_resize_start_child(False)
+        toast=self.Adw.ToastOverlay();toast.set_child(paned);self.ui.toast=toast
+        toolbar=self.Adw.ToolbarView();toolbar.add_top_bar(header);toolbar.set_content(toast);window.set_content(toolbar);self._css();self.refresh();window.present()
     def _button_spec(self,s):
         m=BUTTON_RE.match(s)
-        if not m: return None
-        label=m.group("label").strip('"')
-        return label,m.group("icon"),bool(m.group("emph")),m.group("desire")
-
-    def _button(self,label,icon,emph,desire):
+        if not m:return None
+        return m.group('label').strip('"'),m.group('icon'),bool(m.group('emph')),m.group('desire'),m.group('when')
+    def _make_button(self,spec):
+        label,icon,emph,desire,cond=spec
         if icon:
-            box=self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL,spacing=6)
-            box.append(self.Gtk.Image.new_from_icon_name(icon)); box.append(self.Gtk.Label(label=label))
-            b=self.Gtk.Button(); b.set_child(box)
-        else: b=self.Gtk.Button(label=label)
-        if emph: b.add_css_class("suggested-action")
-        b.connect("clicked",lambda _b,d=desire:self.invoke_desire(d)); self.ui.buttons[desire]=b
-        return b
-
+            box=self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL,spacing=6);box.append(self.Gtk.Image.new_from_icon_name(icon));box.append(self.Gtk.Label(label=label));b=self.Gtk.Button();b.set_child(box)
+        else:b=self.Gtk.Button(label=label)
+        if emph:b.add_css_class('suggested-action')
+        b.connect('clicked',lambda _b,d=desire:self.invoke(d));self.ui.buttons[desire]=(b,cond);return b
     def _header(self,header,node):
         for _,s in node.statements:
             if spec:=self._button_spec(s):
-                b=self._button(*spec)
-                (header.pack_end if spec[2] or spec[3] in {"Undo","Redo","FitView"} else header.pack_start)(b)
-
+                b=self._make_button(spec);(header.pack_end if spec[2] else header.pack_start)(b)
     def _sidebar(self,node):
-        G,A=self.Gtk,self.Adw
-        side=G.Box(orientation=G.Orientation.VERTICAL,spacing=18); side.set_size_request(310,-1)
-        for e,v in (("top",18),("bottom",14),("start",16),("end",16)): getattr(side,f"set_margin_{e}")(v)
+        side=self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL,spacing=18);side.set_size_request(310,-1)
+        for edge,val in [('top',18),('bottom',14),('start',16),('end',16)]:getattr(side,f'set_margin_{edge}')(val)
         for group in node.children if node else []:
-            if group.kind!="group": continue
-            title=group.name.strip('"'); prefs=A.PreferencesGroup(title=title)
-            if title=="Source":
-                self.ui.source=A.ActionRow(title="No scan loaded",subtitle="PNG, JPEG, TIFF or SANE scanner"); prefs.add(self.ui.source)
-            elif title=="Frames":
-                self.ui.frames=A.ActionRow(title="Detected frames",subtitle="0 frames")
-                for _,s in group.statements:
-                    if spec:=self._button_spec(s):
-                        b=self._button(*spec)
-                        if spec[3]=="DeleteFrame": b.add_css_class("destructive-action")
-                        self.ui.frames.add_suffix(b)
-                prefs.add(self.ui.frames); self.ui.selected=A.ActionRow(title="Selected frame",subtitle=""); self.ui.selected.set_visible(False); prefs.add(self.ui.selected)
-            elif title=="Crop":
-                row=A.ActionRow(title="Padding",subtitle="Extra pixels around AI-detected prints")
-                self.ui.padding=G.SpinButton.new_with_range(0,100,1); self.ui.padding.connect("value-changed",lambda s:self.state.__setitem__("padding",s.get_value_as_int()))
-                row.add_suffix(self.ui.padding); prefs.add(row)
-            elif title=="Adaptive assistance":
-                self.ui.assist=A.ActionRow(title="Interaction model",subtitle="Learning your editing rhythm"); prefs.add(self.ui.assist)
-            elif title=="View":
-                self.ui.zoom=A.ActionRow(title="Zoom",subtitle="100%"); prefs.add(self.ui.zoom)
+            if group.kind!='group':continue
+            title=group.name.strip('"');prefs=self.Adw.PreferencesGroup(title=title)
+            for _,s in group.statements:
+                if spec:=self._button_spec(s):
+                    row=self.Adw.ActionRow(title=spec[0]);row.add_suffix(self._make_button(spec));prefs.add(row);continue
+                if s.startswith('value '):
+                    body=s[6:];label=title;cond=None;fallback=None
+                    if ' when ' in body:body,cond=body.split(' when ',1)
+                    if ' label ' in body:
+                        expr,labelpart=body.split(' label ',1);body=expr;label=labelpart.strip().strip('"')
+                    if ' fallback ' in body:
+                        expr,fb=body.split(' fallback ',1);body=expr;fallback=fb.strip().strip('"')
+                    row=self.Adw.ActionRow(title=label,subtitle='');prefs.add(row);self.ui.bindings.append((row,body.strip(),fallback,cond))
+                elif s.startswith('number '):
+                    m=re.match(r'number\s+(\S+)\s+([0-9.]+)\.\.([0-9.]+)(?:\s+label\s+"([^"]+)")?',s)
+                    if m:
+                        path,lo,hi,label=m.groups();row=self.Adw.ActionRow(title=label or path);spin=self.Gtk.SpinButton.new_with_range(float(lo),float(hi),1);spin.connect('value-changed',lambda sp,p=path:(self.engine.set(p,sp.get_value_as_int()),self.engine.changed()));row.add_suffix(spin);prefs.add(row);self.ui.numbers.append((spin,path))
             side.append(prefs)
-        row=G.Box(orientation=G.Orientation.HORIZONTAL,spacing=8); row.set_valign(G.Align.END); row.set_vexpand(True)
-        self.ui.spinner=G.Spinner(); self.ui.spinner.set_visible(False)
-        self.ui.status=G.Label(label=self.state["message"]); self.ui.status.set_wrap(True); self.ui.status.set_xalign(0); self.ui.status.add_css_class("dim-label")
-        row.append(self.ui.spinner); row.append(self.ui.status); side.append(row); return side
-
+        row=self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL,spacing=8);row.set_valign(self.Gtk.Align.END);row.set_vexpand(True);self.ui.spinner=self.Gtk.Spinner();self.ui.spinner.set_visible(False);self.ui.status=self.Gtk.Label(label='');self.ui.status.set_wrap(True);self.ui.status.set_xalign(0);row.append(self.ui.spinner);row.append(self.ui.status);side.append(row);return side
     def _canvas(self,node):
-        G,A=self.Gtk,self.Adw
-        d=G.DrawingArea(); d.set_hexpand(True); d.set_vexpand(True); d.set_focusable(True); d.add_css_class("scan-canvas"); d.set_draw_func(self._draw); self.ui.drawing=d
-        motion=G.EventControllerMotion(); motion.connect("motion",self._motion); d.add_controller(motion)
-        drag=G.GestureDrag(); drag.set_button(1); drag.connect("drag-begin",self._drag_begin); drag.connect("drag-update",self._drag_update); drag.connect("drag-end",self._drag_end); d.add_controller(drag)
-        scroll=G.EventControllerScroll.new(G.EventControllerScrollFlags.VERTICAL); scroll.connect("scroll",self._scroll); d.add_controller(scroll)
-        empty=A.StatusPage(title="Open or scan an image",description="Open PNG, JPEG or TIFF, or scan directly from a SANE-compatible scanner",icon_name="scanner-symbolic")
-        actions=G.Box(orientation=G.Orientation.HORIZONTAL,spacing=8); actions.set_halign(G.Align.CENTER); specs=[]
+        d=self.Gtk.DrawingArea();d.set_hexpand(True);d.set_vexpand(True);d.set_focusable(True);d.add_css_class('mora-canvas');d.set_draw_func(self._draw);self.ui.drawing=d
+        self.canvas={'image':None,'shapes':None,'focus':None,'view':None,'adapt':None,'gestures':{}}
         if node:
-            for n in node.walk():
-                if n.header=="offer Empty":
-                    for _,s in n.statements:
-                        if m:=ACTION_RE.match(s): specs.append(m.groups())
-        for label,desire in specs or [("Scan from Scanner…","ScanImage"),("Open Image…","OpenScan")]:
-            b=G.Button(label=label); b.connect("clicked",lambda _b,d=desire:self.invoke_desire(d)); actions.append(b)
-        empty.set_child(actions); self.ui.empty=empty
-        over=G.Overlay(); over.set_child(d); over.add_overlay(empty); return over
-
+            for _,s in node.statements:
+                p=s.split()
+                if not p:continue
+                if p[0]=='image':self.canvas['image']=p[1]
+                elif p[0]=='shapes':self.canvas['shapes']=p[1]
+                elif p[0]=='focus':self.canvas['focus']=p[1]
+                elif p[0]=='view':self.canvas['view']=p[1]
+                elif p[0]=='adapt' and len(p)>=3:self.canvas['adapt']=p[2]
+            for c in node.children:
+                if c.header.startswith('gesture '):self.canvas['gestures'][c.header[8:]]=c
+        motion=self.Gtk.EventControllerMotion();motion.connect('motion',self._motion);d.add_controller(motion)
+        drag=self.Gtk.GestureDrag();drag.set_button(1);drag.connect('drag-begin',self._drag_begin);drag.connect('drag-update',self._drag_update);drag.connect('drag-end',self._drag_end);d.add_controller(drag)
+        scroll=self.Gtk.EventControllerScroll.new(self.Gtk.EventControllerScrollFlags.VERTICAL);scroll.connect('scroll',self._scroll);d.add_controller(scroll)
+        empty=self.Adw.StatusPage(title='No content',description='');actions=self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL,spacing=8);actions.set_halign(self.Gtk.Align.CENTER)
+        if node:
+            for c in node.walk():
+                if c.header.startswith('empty when '):
+                    self.canvas['empty_condition']=c.header[len('empty when '):]
+                    for _,s in c.statements:
+                        if m:=re.match(r'icon\s+(\S+)',s):empty.set_icon_name(m.group(1))
+                        elif m:=re.match(r'title\s+"([^"]+)"',s):empty.set_title(m.group(1))
+                        elif m:=ACTION_RE.match(s):
+                            b=self.Gtk.Button(label=m.group(1));b.connect('clicked',lambda _b,d=m.group(2):self.invoke(d));actions.append(b)
+        empty.set_child(actions);self.ui.empty=empty;over=self.Gtk.Overlay();over.set_child(d);over.add_overlay(empty);return over
     def _css(self):
-        p=self.Gtk.CssProvider()
-        css=b".scan-canvas { background: @view_bg_color; } .dim-label { opacity: .72; }"
-        try: p.load_from_data(css)
-        except TypeError: p.load_from_string(css.decode())
-        if disp:=self.Gdk.Display.get_default(): self.Gtk.StyleContext.add_provider_for_display(disp,p,self.Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-
-    def invoke_desire(self,name):
-        node=self.program.declaration("desire",name)
-        if not node: return self._message(f"Unknown desire: {name}")
-        text=node.text()
-        if "requires scan" in text and not self.state["scan"]: return
-        if "requires selection" in text and self.state["selection"] is None: return
-        if "ask user for image-file through files" in text: self._open()
-        elif "ask user for scanner among scanner.discover" in text: self._scan()
-        elif "ask vision to perceive PhysicalPhoto" in text: self._detect()
-        elif "imagine frame centered in scan" in text: self._add()
-        elif "remove selection from frames" in text: self._delete()
-        elif "restore previous world" in text: self._undo()
-        elif "restore next world" in text: self._redo()
-        elif "make view fitted" in text: self._fit()
-        elif "ask user for folder through files" in text: self._export()
-        else: self._message(f"No faculty can fulfill {name} yet.")
-
-    def _open(self):
-        q=self.Gtk.FileChooserNative.new("Open scan",self.ui.window,self.Gtk.FileChooserAction.OPEN,"Open","Cancel")
-        f=self.Gtk.FileFilter(); f.set_name("Images")
-        for p in ("*.png","*.jpg","*.jpeg","*.tif","*.tiff"): f.add_pattern(p)
-        q.add_filter(f)
-        def response(d,c):
-            if c==self.Gtk.ResponseType.ACCEPT and (file:=d.get_file()) and (path:=file.get_path()):
-                self._busy(True,f"Loading {pathlib.Path(path).name}…"); self._bg(lambda:faculties.load_image(path),lambda v,e:self._image_ready(v,e,path))
-            d.destroy()
-        q.connect("response",response); q.show()
-
-    def _image_ready(self,image,error,source):
-        if error: self._busy(False,f"Could not open image: {error}"); return
-        self.state.update(scan={"image":image,"source":source},frames=[],selection=None,history={"past":[],"future":[]},view={"zoom":1.0,"x":0.0,"y":0.0})
-        self._preview(); self._busy(False,f"Loaded {pathlib.Path(source).name}"); self.affect.perceive("scan arrived"); self._redraw()
-
-    def _scan(self):
-        self._busy(True,"Looking for scanners…"); self._bg(faculties.list_scanners,self._scanner_list)
-
-    def _scanner_list(self,devices,error):
-        self._busy(False)
-        if error: self.affect.perceive("failure"); return self._message(str(error))
-        if not devices: return self._message("No SANE scanners found.")
-        d=self.Gtk.Dialog(title="Scan from scanner",transient_for=self.ui.window,modal=True); d.add_button("Cancel",self.Gtk.ResponseType.CANCEL); d.add_button("Scan",self.Gtk.ResponseType.OK)
-        box=d.get_content_area(); box.set_spacing(12)
-        combo=self.Gtk.ComboBoxText()
-        for dev in devices: combo.append_text(dev.label)
-        combo.set_active(0); dpi=self.Gtk.SpinButton.new_with_range(75,1200,25); dpi.set_value(600)
-        box.append(combo); box.append(dpi)
-        def response(dlg,code):
-            if code==self.Gtk.ResponseType.OK:
-                dev=devices[max(0,combo.get_active())]; res=int(dpi.get_value()); dlg.destroy(); self._busy(True,f"Scanning at {res} DPI…")
-                self._bg(lambda:faculties.acquire_scan(dev.id,res),lambda v,e:self._scan_ready(v,e,dev.label)); return
-            dlg.destroy()
-        d.connect("response",response); d.present()
-
-    def _scan_ready(self,image,error,label):
-        if error: self._busy(False,f"Scan failed: {error}"); self.affect.perceive("failure"); return
-        self.state.update(scan={"image":image,"source":label},frames=[],selection=None,history={"past":[],"future":[]},view={"zoom":1.0,"x":0.0,"y":0.0})
-        self._preview(); self._busy(False,f"Scanned from {label}."); self.affect.perceive("scan arrived"); self._redraw()
-
-    def _detect(self):
-        if self.state["busy"] or not self.state["scan"]: return
-        try: key=faculties.keyring_get(self.app_id,"openai-api-key")
-        except Exception as e: return self._message(str(e))
-        if not key: return self._api_key(self._detect)
-        if self.state["frames"]: self.affect.perceive("repeated redetection")
-        image=self.state["scan"]["image"].copy(); margin=self.state["padding"]; self._busy(True,"Detecting physical photos…")
-        self._bg(lambda:faculties.detect_photos_openai(image,key,self.model,margin),self._detect_ready)
-
-    def _api_key(self,after):
-        d=self.Gtk.Dialog(title="OpenAI API key",transient_for=self.ui.window,modal=True); d.add_button("Cancel",self.Gtk.ResponseType.CANCEL); d.add_button("Save",self.Gtk.ResponseType.OK)
-        box=d.get_content_area(); box.set_spacing(12); entry=self.Gtk.PasswordEntry(); entry.set_show_peek_icon(True)
-        box.append(self.Gtk.Label(label="Photo detection uses your OpenAI API key. It is stored in the system keyring.",xalign=0)); box.append(entry)
-        box.append(self.Gtk.LinkButton.new_with_label("https://platform.openai.com/api-keys","Create an API key…"))
-        def response(dlg,code):
-            if code==self.Gtk.ResponseType.OK and (value:=entry.get_text().strip()):
-                try: faculties.keyring_set(self.app_id,"openai-api-key",value,"Scan Slicer Emo OpenAI API key"); dlg.destroy(); after(); return
-                except Exception as e: self._message(str(e))
-            dlg.destroy()
-        d.connect("response",response); d.present()
-
-    def _detect_ready(self,frames,error):
-        self._busy(False)
-        if error: self.affect.perceive("failure"); return self._message(f"Detection failed: {error}")
-        self.state.update(frames=frames,selection=None,history={"past":[],"future":[]}); self._message(f"Detected {len(frames)} photo{'s' if len(frames)!=1 else ''}."); self.affect.perceive("detection succeeded")
-        baseline=self.affect.event_counts.get("correction(frame)",0)
-        def stable():
-            if self.affect.event_counts.get("correction(frame)",0)==baseline: self.affect.perceive("detection succeeded and no correction for 20s")
-            return False
-        self.GLib.timeout_add_seconds(20,stable); self._redraw()
-
-    def _push(self):
-        h=self.state["history"]; h["past"].append({"frames":copy.deepcopy(self.state["frames"]),"selection":self.state["selection"]}); h["past"]=h["past"][-100:]; h["future"].clear()
-
-    def _add(self):
-        self._push(); w,h=self.state["scan"]["image"].size; fw,fh=max(100,w/3),max(100,h/3); x,y=(w-fw)/2,(h-fh)/2
-        self.state["frames"].append({"corners":[[x,y],[x+fw,y],[x+fw,y+fh],[x,y+fh]]}); self.state["selection"]=len(self.state["frames"])-1
-        self.affect.perceive("user adds missing frame"); self._message("Added a frame."); self._redraw()
-
-    def _delete(self):
-        i=self.state["selection"]
-        if i is None:return
-        self._push(); self.state["frames"].pop(i); self.state["selection"]=None; self.affect.perceive("user deletes detected frame"); self._redraw()
-
-    def _undo(self):
-        h=self.state["history"]
-        if not h["past"]:return
-        h["future"].append({"frames":copy.deepcopy(self.state["frames"]),"selection":self.state["selection"]}); s=h["past"].pop(); self.state["frames"],self.state["selection"]=s["frames"],s["selection"]; self.affect.perceive("undo"); self._redraw()
-
-    def _redo(self):
-        h=self.state["history"]
-        if not h["future"]:return
-        h["past"].append({"frames":copy.deepcopy(self.state["frames"]),"selection":self.state["selection"]}); s=h["future"].pop(); self.state["frames"],self.state["selection"]=s["frames"],s["selection"]; self._redraw()
-
-    def _fit(self):
-        self.state["view"]={"zoom":1.0,"x":0.0,"y":0.0}; self.refresh(); self._redraw()
-
-    def _export(self):
-        if not self.state["frames"]:return
-        q=self.Gtk.FileChooserNative.new("Export photos",self.ui.window,self.Gtk.FileChooserAction.SELECT_FOLDER,"Export","Cancel")
-        def response(d,c):
-            if c==self.Gtk.ResponseType.ACCEPT and (f:=d.get_file()) and (folder:=f.get_path()): self._export_to(folder)
-            d.destroy()
-        q.connect("response",response); q.show()
-
-    def _export_to(self,folder):
-        self._busy(True,f"Exporting {len(self.state['frames'])} photos…"); image=self.state["scan"]["image"].copy(); frames=copy.deepcopy(self.state["frames"])
-        source=str(self.state["scan"]["source"]); stem=pathlib.Path(source).stem if os.path.isfile(source) else "scan"
+        p=self.Gtk.CssProvider();p.load_from_string('.mora-canvas { background: @view_bg_color; }');disp=self.Gdk.Display.get_default()
+        if disp:self.Gtk.StyleContext.add_provider_for_display(disp,p,self.Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    def invoke(self,name):
+        try:g=self.engine.desire(name)
+        except Exception as e:return self._message(str(e))
+        self._drive(g)
+    def _drive(self,g,value=None,error=None):
+        try:req=g.throw(error) if error else g.send(value)
+        except StopIteration:return self.refresh()
+        except Exception as e:return self._message(str(e))
+        if not isinstance(req,Request):return self._drive(g,req)
+        provider=self.registry.provider(req.faculty)
+        if provider=='desktop.files':return self._files_request(req,g)
+        if provider=='desktop.forms':return self._form_request(req,g)
         def work():
-            for i,f in enumerate(frames,1): faculties.perspective_crop(image,f["corners"]).save(os.path.join(folder,f"{stem}_{i:02}.png"),format="PNG")
-            return len(frames)
-        def done(n,e):
-            self._busy(False)
-            if e:self.affect.perceive("failure"); self._message(f"Export failed: {e}")
-            else:self.affect.perceive("export succeeded"); self._message(f"Exported {n} photos to {folder}")
-        self._bg(work,done)
-
-    def _preview(self):
-        from PIL import Image
-        image=self.state["scan"]["image"]; thumb=image.copy(); thumb.thumbnail((2400,2400),Image.Resampling.LANCZOS)
-        buf=io.BytesIO(); thumb.convert("RGBA").save(buf,format="PNG"); loader=self.GdkPixbuf.PixbufLoader.new_with_type("png"); loader.write(buf.getvalue()); loader.close()
-        self.state["preview"]=loader.get_pixbuf(); self.state["preview_ratio"]=self.state["preview"].get_width()/image.size[0]
-
-    def _transform(self,w,h):
-        p=self.state["preview"]
-        if not p:return None
-        pw,ph=p.get_width(),p.get_height(); fit=min(max(1,w)/pw,max(1,h)/ph); v=self.state["view"]; scale=fit*v["zoom"]
-        return {"scale":scale,"full":scale*self.state["preview_ratio"],"x":(w-pw*scale)/2+v["x"],"y":(h-ph*scale)/2+v["y"]}
-
-    def _screen(self,p,t):return (t["x"]+p[0]*t["full"],t["y"]+p[1]*t["full"])
-    def _image(self,p,t):return ((p[0]-t["x"])/t["full"],(p[1]-t["y"])/t["full"])
-    def _mid(self,a,b):return ((a[0]+b[0])/2,(a[1]+b[1])/2)
-    def _assist(self):return (11,24,True) if "PreciseEditing" in self.affect.offers else (7,0,False)
-
-    def _hit(self,x,y):
-        if not self.state["preview"]:return None
-        t=self._transform(self.ui.drawing.get_width(),self.ui.drawing.get_height()); handle,_,_=self._assist(); sel=self.state["selection"]
-        if sel is not None and sel<len(self.state["frames"]):
-            pts=[self._screen(p,t) for p in self.state["frames"][sel]["corners"]]
-            for i,p in enumerate(pts):
-                if math.hypot(x-p[0],y-p[1])<=handle+4:return sel,"corner",i
-            for i,(a,b) in enumerate(((0,1),(1,2),(2,3),(3,0))):
-                m=self._mid(pts[a],pts[b])
-                if math.hypot(x-m[0],y-m[1])<=handle+4:return sel,"edge",i
-        ip=self._image((x,y),t)
-        for i in range(len(self.state["frames"])-1,-1,-1):
-            if faculties.point_in_quad(ip,self.state["frames"][i]["corners"]):return i,"move",None
-
-    def _draw(self,_a,cr,w,h):
-        p=self.state["preview"]
-        if not p:return
-        t=self._transform(w,h); cr.save(); cr.translate(t["x"],t["y"]); cr.scale(t["scale"],t["scale"]); self.Gdk.cairo_set_source_pixbuf(cr,p,0,0); cr.paint(); cr.restore()
-        handle,_,mag=self._assist()
-        for i,f in enumerate(self.state["frames"]):
-            pts=[self._screen(q,t) for q in f["corners"]]; cr.move_to(*pts[0])
-            for q in pts[1:]:cr.line_to(*q)
-            cr.close_path(); cr.set_source_rgba(.2,.65,1,.95) if i==self.state["selection"] else cr.set_source_rgba(1,1,1,.82); cr.set_line_width(2.5 if i==self.state["selection"] else 1.6); cr.stroke()
-            if i==self.state["selection"]:
-                cr.set_source_rgba(.2,.65,1,1)
-                for q in pts:cr.arc(q[0],q[1],handle,0,math.tau);cr.fill()
-                for a,b in ((0,1),(1,2),(2,3),(3,0)):
-                    q=self._mid(pts[a],pts[b]);cr.arc(q[0],q[1],max(4,handle-2),0,math.tau);cr.fill()
-        if mag and self.state["drag"] and self.state["drag"]["kind"]!="pan":self._magnifier(cr,w,h,t)
-
-    def _magnifier(self,cr,w,h,t):
-        x0,y0=self.state["hover"]; ip=self._image((x0,y0),t); ratio=self.state["preview_ratio"]; px,py=ip[0]*ratio,ip[1]*ratio; size,zoom=150,5
-        x=min(w-size-12,max(12,x0+24)); y=min(h-size-12,max(12,y0+24)); cr.save(); cr.rectangle(x,y,size,size);cr.clip();cr.translate(x+size/2-px*zoom,y+size/2-py*zoom);cr.scale(zoom,zoom);self.Gdk.cairo_set_source_pixbuf(cr,self.state["preview"],0,0);cr.paint();cr.restore();cr.rectangle(x,y,size,size);cr.set_source_rgba(.15,.55,.95,1);cr.stroke()
-
-    def _motion(self,_c,x,y):self.state["hover"]=(x,y); self._redraw() if self.state["drag"] else None
-
-    def _drag_begin(self,_g,x,y):
-        if not self.state["scan"]:return
-        hit=self._hit(x,y)
-        if not hit:self.state["selection"]=None;self.state["drag"]={"kind":"pan","view":copy.deepcopy(self.state["view"])}
-        elif self.state["selection"]==hit[0]:self._push();self.state["drag"]={"kind":hit[1],"part":hit[2],"index":hit[0],"frame":copy.deepcopy(self.state["frames"][hit[0]])}
-        else:self.state["selection"]=hit[0];self.state["drag"]={"kind":"pan","view":copy.deepcopy(self.state["view"])}
-        self.refresh();self._redraw()
-
-    def _drag_update(self,_g,dx,dy):
-        d=self.state["drag"]
-        if not d:return
-        if d["kind"]=="pan":self.state["view"]["x"]=d["view"]["x"]+dx;self.state["view"]["y"]=d["view"]["y"]+dy;return self._redraw()
-        t=self._transform(self.ui.drawing.get_width(),self.ui.drawing.get_height());ix,iy=dx/t["full"],dy/t["full"];i=d["index"];pts=d["frame"]["corners"];w,h=self.state["scan"]["image"].size;_,snap,_=self._assist()
-        if d["kind"]=="move":new=faculties.move_quad(pts,ix,iy,w,h)
-        elif d["kind"]=="corner":new=faculties.move_corner(pts,d["part"],ix,iy,w,h,snap)
-        else:
-            a,b=((0,1),(1,2),(2,3),(3,0))[d["part"]];new=faculties.move_edge(pts,a,b,ix,iy,w,h,snap)
-        self.state["frames"][i]["corners"]=new;self._redraw()
-
-    def _drag_end(self,_g,dx,dy):
-        d=self.state["drag"];self.state["drag"]=None
-        if d and d["kind"]!="pan":self.affect.perceive("correction(frame)");self._message(f"Adjusted frame {d['index']+1}.")
-        self.refresh();self._redraw()
-
-    def _scroll(self,_c,dx,dy):
-        if not self.state["scan"]:return False
-        z=self.state["view"]["zoom"];self.state["view"]["zoom"]=max(.35,min(8,z*(.88 if dy>0 else 1.14)));self.affect.perceive("zooming");self.refresh();self._redraw();return True
-
-    def _bg(self,work,done):
-        def run():
-            try:v,e=work(),None
-            except Exception as exc:v,e=None,exc
-            self.GLib.idle_add(lambda:(done(v,e),False)[1])
-        threading.Thread(target=run,daemon=True).start()
-
-    def _busy(self,value,message=None):
-        self.state["busy"]=value
-        if message is not None:self.state["message"]=message
-        self.refresh()
-
-    def _message(self,text):self.state["message"]=text;self.refresh()
-    def _redraw(self):self.ui.drawing.queue_draw() if self.ui.drawing else None
-
+            try:return self.registry.invoke(req.faculty,req.operation,req.args,req.options),None
+            except Exception as e:return None,e
+        def done(pair):
+            val,err=pair
+            if isinstance(err,MissingSecret):return self._secret_dialog(err,lambda:self._dispatch_again(req,g))
+            self._drive(g,val,err)
+        threading.Thread(target=lambda:self.GLib.idle_add(done,work()),daemon=True).start()
+    def _dispatch_again(self,req,g):
+        def work():
+            try:return self.registry.invoke(req.faculty,req.operation,req.args,req.options),None
+            except Exception as e:return None,e
+        threading.Thread(target=lambda:self.GLib.idle_add(lambda pair:(self._drive(g,pair[0],pair[1]),False)[1],work()),daemon=True).start()
+    def _files_request(self,req,g):
+        if req.operation=='numbered-path':return self._drive(g,self.registry.invoke(req.faculty,req.operation,req.args,req.options))
+        action=self.Gtk.FileChooserAction.OPEN if req.operation=='choose-image' else self.Gtk.FileChooserAction.SELECT_FOLDER;title=str(req.options.get('title','Choose'))
+        q=self.Gtk.FileChooserNative.new(title,self.ui.window,action,'Choose','Cancel')
+        if req.operation=='choose-image' and (ext:=req.options.get('extensions')):
+            f=self.Gtk.FileFilter();f.set_name('Files')
+            for x in str(ext).split():f.add_pattern('*.'+x)
+            q.add_filter(f)
+        def response(d,c):
+            val=None
+            if c==self.Gtk.ResponseType.ACCEPT and (f:=d.get_file()):val=f.get_path()
+            d.destroy();self._drive(g,val,None if val else MoraError('cancelled'))
+        q.connect('response',response);q.show()
+    def _form_request(self,req,g):
+        if req.operation!='choose':return self._drive(g,None,MoraError(f'unsupported form operation {req.operation}'))
+        opts=req.options;items=opts.get('options') or []
+        d=self.Gtk.Dialog(title=str(opts.get('title','Choose')),transient_for=self.ui.window,modal=True);d.add_button('Cancel',self.Gtk.ResponseType.CANCEL);d.add_button('OK',self.Gtk.ResponseType.OK);box=d.get_content_area();box.set_spacing(12)
+        combo=self.Gtk.ComboBoxText()
+        for x in items:combo.append_text(getattr(x,'label',str(x)))
+        combo.set_active(0);box.append(combo);spins={}
+        for key,val in opts.items():
+            if key.startswith('field-'):
+                m=re.search(r'default\s+([0-9.]+).*min\s+([0-9.]+).*max\s+([0-9.]+)',str(val))
+                if m:
+                    sp=self.Gtk.SpinButton.new_with_range(float(m.group(2)),float(m.group(3)),1);sp.set_value(float(m.group(1)));box.append(self.Gtk.Label(label=key[6:]));box.append(sp);spins[key[6:]]=sp
+        def response(_d,c):
+            if c!=self.Gtk.ResponseType.OK:d.destroy();return self._drive(g,None,MoraError('cancelled'))
+            result={'option':items[max(0,combo.get_active())] if items else None}
+            for k,sp in spins.items():result[k]=sp.get_value_as_int()
+            d.destroy();self._drive(g,result)
+        d.connect('response',response);d.present()
+    def _secret_dialog(self,missing,after):
+        cfg=missing.config;d=self.Gtk.Dialog(title=cfg.get('secret_label',missing.key),transient_for=self.ui.window,modal=True);d.add_button('Cancel',self.Gtk.ResponseType.CANCEL);d.add_button('Save',self.Gtk.ResponseType.OK);box=d.get_content_area();box.set_spacing(12)
+        if cfg.get('secret_help'):box.append(self.Gtk.Label(label=cfg['secret_help'],wrap=True,xalign=0))
+        entry=self.Gtk.PasswordEntry();entry.set_show_peek_icon(True);box.append(entry)
+        if cfg.get('secret_link'):box.append(self.Gtk.LinkButton.new_with_label(cfg['secret_link'],'Open link…'))
+        def response(_d,c):
+            if c==self.Gtk.ResponseType.OK and (v:=entry.get_text().strip()):
+                from .faculties import secret_set;secret_set(self.app_id,missing.key,v,cfg.get('secret_label',missing.key));d.destroy();after();return
+            d.destroy()
+        d.connect('response',response);d.present()
+    def _value(self,expr):
+        expr=expr.strip()
+        if m:=re.match(r'count\((.+)\)',expr):return len(self.engine.get(m.group(1)) or [])
+        if m:=re.match(r'dimensions\((.+)\)',expr):
+            v=self._value(m.group(1))
+            if hasattr(v,'size'):return f'{v.size[0]} × {v.size[1]}'
+            if isinstance(v,(list,tuple)) and len(v)==4:
+                l,t,r,b=quad_bounds(v);return f'{int(r-l)} × {int(b-t)}'
+            return ''
+        if m:=re.match(r'item-at\(([^,]+),\s*([^)]+)\)',expr):
+            seq=self.engine.get(m.group(1).strip()) or [];idx=self.engine.get(m.group(2).strip());return seq[idx] if idx is not None and 0<=int(idx)<len(seq) else None
+        if m:=re.match(r'percent\((.+)\)',expr):
+            v=self.engine.get(m.group(1)) or 0;return f'{round(float(v)*100)}%'
+        return self.engine.get(expr)
     def refresh(self):
-        if self.ui.status:self.ui.status.set_text(self.state["message"])
-        if self.ui.spinner:self.ui.spinner.set_visible(self.state["busy"]);self.ui.spinner.set_spinning(self.state["busy"])
-        if self.ui.empty:self.ui.empty.set_visible(not self.state["scan"])
-        scan=self.state["scan"]
-        if self.ui.source:
-            if scan:self.ui.source.set_title(pathlib.Path(str(scan["source"])).name);self.ui.source.set_subtitle(f"{scan['image'].size[0]} × {scan['image'].size[1]} px")
-            else:self.ui.source.set_title("No scan loaded");self.ui.source.set_subtitle("PNG, JPEG, TIFF or SANE scanner")
-        if self.ui.frames:self.ui.frames.set_subtitle(f"{len(self.state['frames'])} frame{'s' if len(self.state['frames'])!=1 else ''}")
-        if self.ui.selected:
-            i=self.state["selection"];self.ui.selected.set_visible(i is not None)
-            if i is not None and i<len(self.state["frames"]):
-                l,t,r,b=faculties.frame_bounds(self.state["frames"][i]["corners"]);self.ui.selected.set_title(f"Frame {i+1}");self.ui.selected.set_subtitle(f"{int(r-l)} × {int(b-t)} px")
-        if self.ui.assist:self.ui.assist.set_subtitle("Precise assistance" if "PreciseEditing" in self.affect.offers else "Learning your editing rhythm")
-        if self.ui.zoom:self.ui.zoom.set_subtitle(f"{round(self.state['view']['zoom']*100)}%")
-        idle=not self.state["busy"]
-        for desire,b in self.ui.buttons.items():
-            text=(self.program.declaration("desire",desire).text() if self.program.declaration("desire",desire) else "")
-            ok=idle and ("requires scan" not in text or bool(scan)) and ("requires selection" not in text or self.state["selection"] is not None)
-            if desire=="ExportPhotos":ok=ok and bool(self.state["frames"])
-            if desire=="Undo":ok=ok and bool(self.state["history"]["past"])
-            if desire=="Redo":ok=ok and bool(self.state["history"]["future"])
-            b.set_sensitive(ok)
+        if self.ui.status:self.ui.status.set_text(self.engine.message)
+        for row,expr,fallback,cond in self.ui.bindings:
+            visible=True if not cond else self.engine.condition(cond);row.set_visible(visible)
+            val=self._value(expr);row.set_subtitle(str(val if val not in (None,'') else fallback or ''))
+        for spin,path in self.ui.numbers:
+            v=self.engine.get(path)
+            if v is not None and int(spin.get_value())!=int(v):spin.set_value(float(v))
+        for _,(b,cond) in self.ui.buttons.items():b.set_sensitive(True if not cond else self.engine.condition(cond))
+        if self.ui.empty:self.ui.empty.set_visible(self.engine.condition(self.canvas.get('empty_condition','false')))
+        self._ensure_preview();self._redraw()
+    def _ensure_preview(self):
+        image=self.engine.get(self.canvas.get('image')) if self.canvas.get('image') else None
+        if image is None:self.preview=None;return
+        if getattr(self,'_preview_source',None) is image:return
+        from PIL import Image
+        thumb=image.copy();thumb.thumbnail((2400,2400),Image.Resampling.LANCZOS);buf=io.BytesIO();thumb.convert('RGBA').save(buf,format='PNG');loader=self.GdkPixbuf.PixbufLoader.new_with_type('png');loader.write(buf.getvalue());loader.close();self.preview=loader.get_pixbuf();self.preview_ratio=self.preview.get_width()/image.size[0];self._preview_source=image
+    def _view(self):
+        p=self.canvas.get('view');v=self.engine.get(p) if p else None
+        if not isinstance(v,dict):v={'zoom':1.,'x':0.,'y':0.};self.engine.set(p,v)
+        return v
+    def _transform(self,w,h):
+        if not self.preview:return None
+        pw,ph=self.preview.get_width(),self.preview.get_height();v=self._view();fit=min(max(1,w)/pw,max(1,h)/ph);scale=fit*float(v.get('zoom',1));return {'scale':scale,'full':scale*self.preview_ratio,'x':(w-pw*scale)/2+v.get('x',0),'y':(h-ph*scale)/2+v.get('y',0)}
+    def _screen(self,p,t):return (t['x']+p[0]*t['full'],t['y']+p[1]*t['full'])
+    def _image_point(self,p,t):return ((p[0]-t['x'])/t['full'],(p[1]-t['y'])/t['full'])
+    def _assist(self):
+        name=self.canvas.get('adapt')
+        if not name or name not in self.engine.affect.offers:return 7.,0.,False
+        n=self.program.declaration('offer',name);handle,snap,mag=7.,0.,False
+        if n:
+            for _,s in n.statements:
+                if m:=re.match(r'handles\s+([0-9.]+)px',s):handle=float(m.group(1))
+                elif m:=re.match(r'snapping\s+([0-9.]+)px',s):snap=float(m.group(1))
+                elif s.startswith('magnifier '):mag=True
+        return handle,snap,mag
+    def _shapes(self):return self.engine.get(self.canvas.get('shapes')) or []
+    def _focus(self):return self.engine.get(self.canvas.get('focus'))
+    def _hit(self,x,y):
+        if not self.preview:return None
+        t=self._transform(self.ui.drawing.get_width(),self.ui.drawing.get_height());h,_,_=self._assist();focus=self._focus();shapes=self._shapes()
+        if focus is not None and 0<=int(focus)<len(shapes):
+            pts=[self._screen(p,t) for p in shapes[int(focus)]]
+            for i,p in enumerate(pts):
+                if math.hypot(x-p[0],y-p[1])<=h+4:return int(focus),'corner',i
+            for i,(a,b) in enumerate(((0,1),(1,2),(2,3),(3,0))):
+                m=((pts[a][0]+pts[b][0])/2,(pts[a][1]+pts[b][1])/2)
+                if math.hypot(x-m[0],y-m[1])<=h+4:return int(focus),'edge',i
+        ip=self._image_point((x,y),t)
+        for i in range(len(shapes)-1,-1,-1):
+            if point_in_quad(ip,shapes[i]):return i,'shape',None
+    def _draw(self,_a,cr,w,h):
+        if not self.preview:return
+        t=self._transform(w,h);cr.save();cr.translate(t['x'],t['y']);cr.scale(t['scale'],t['scale']);self.Gdk.cairo_set_source_pixbuf(cr,self.preview,0,0);cr.paint();cr.restore();focus=self._focus();handle,_,mag=self._assist()
+        for i,q in enumerate(self._shapes()):
+            pts=[self._screen(p,t) for p in q];cr.move_to(*pts[0])
+            for p in pts[1:]:cr.line_to(*p)
+            cr.close_path();cr.set_source_rgba(.2,.65,1,.95) if i==focus else cr.set_source_rgba(1,1,1,.82);cr.set_line_width(2.5 if i==focus else 1.6);cr.stroke()
+            if i==focus:
+                cr.set_source_rgba(.2,.65,1,1)
+                for p in pts:cr.arc(p[0],p[1],handle,0,math.tau);cr.fill()
+        if mag and self.drag and self.drag.get('kind')!='pan':self._magnifier(cr,w,h,t)
+    def _magnifier(self,cr,w,h,t):
+        x0,y0=self.hover;ip=self._image_point((x0,y0),t);px,py=ip[0]*self.preview_ratio,ip[1]*self.preview_ratio;size,zoom=150,5;x=min(w-size-12,max(12,x0+24));y=min(h-size-12,max(12,y0+24));cr.save();cr.rectangle(x,y,size,size);cr.clip();cr.translate(x+size/2-px*zoom,y+size/2-py*zoom);cr.scale(zoom,zoom);self.Gdk.cairo_set_source_pixbuf(cr,self.preview,0,0);cr.paint();cr.restore();cr.rectangle(x,y,size,size);cr.set_source_rgba(.15,.55,.95,1);cr.stroke()
+    def _motion(self,_c,x,y):self.hover=(x,y);self._redraw() if self.drag else None
+    def _gesture(self,name):return self.canvas.get('gestures',{}).get(name)
+    def _drag_begin(self,_g,x,y):
+        if not self.preview:return
+        hit=self._hit(x,y);focus=self._focus();view=copy.deepcopy(self._view())
+        if hit is None:self.drag={'kind':'pan','view':view};return
+        idx,part,sub=hit
+        if focus!=idx:self.engine.set(self.canvas['focus'],idx);self.engine.changed();self.drag={'kind':'pan','view':view};return
+        kind='shape' if part=='shape' else part;self.drag={'kind':kind,'index':idx,'part':sub,'start':copy.deepcopy(self._shapes()[idx])}
+    def _drag_update(self,_g,dx,dy):
+        if not self.drag:return
+        if self.drag['kind']=='pan':v=self._view();v['x']=self.drag['view'].get('x',0)+dx;v['y']=self.drag['view'].get('y',0)+dy;return self._redraw()
+        t=self._transform(self.ui.drawing.get_width(),self.ui.drawing.get_height());ix,iy=dx/t['full'],dy/t['full'];idx=self.drag['index'];q=self.drag['start'];image=self.engine.get(self.canvas['image']);_,snap,_=self._assist();g=self._gesture(f'drag focused {self.drag["kind"]}')
+        op=None
+        if g:
+            for _,s in g.statements:
+                if s.startswith('use '):op=s[4:].strip()
+        if not op:return
+        alias,operation=op.split('.',1);args=[q,ix,iy,image]
+        if operation=='move-corner':args=[q,self.drag['part'],ix,iy,image,snap]
+        elif operation=='move-edge':args=[q,self.drag['part'],ix,iy,image,snap]
+        self._shapes()[idx]=self.registry.invoke(alias,operation,args);self._redraw()
+    def _drag_end(self,_g,dx,dy):
+        if not self.drag:return
+        kind=self.drag['kind'];self.drag=None
+        if kind!='pan':
+            g=self._gesture(f'drag focused {kind}')
+            if g:
+                for _,s in g.statements:
+                    if m:=re.match(r'perceive\s+(.+)\s+on finish',s):self.engine.affect.perceive(m.group(1));self.engine.changed()
+        self.refresh()
+    def _scroll(self,_c,dx,dy):
+        if not self.preview:return False
+        v=self._view();v['zoom']=max(.35,min(8,float(v.get('zoom',1))*(.88 if dy>0 else 1.14)));g=self._gesture('wheel')
+        if g:
+            for _,s in g.statements:
+                if s.startswith('perceive '):self.engine.affect.perceive(s[9:].strip())
+        self.engine.changed();return True
+    def _message(self,text):
+        if self.ui.toast:self.ui.toast.add_toast(self.Adw.Toast.new(text))
+        self.refresh()
+    def _redraw(self):
+        if self.ui.drawing:self.ui.drawing.queue_draw()

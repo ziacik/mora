@@ -177,7 +177,7 @@ def _vision_perceive(image,concept,model,api_key,detail='high'):
     return out
 
 
-def _number_add(a,b): return float(a)+float(b)
+def _number_add(a,b): return a+b if isinstance(a,(int,float)) and isinstance(b,(int,float)) else float(a)+float(b)
 def _number_clamp(value,low,high): return max(float(low),min(float(high),float(value)))
 def _number_less(a,b): return float(a)<float(b)
 def _number_greater(a,b): return float(a)>float(b)

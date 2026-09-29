@@ -10,7 +10,7 @@ The language runtime is Python-based; GTK and native faculties use system librar
 
 ```bash
 sudo pacman -S python python-gobject gtk4 libadwaita python-pillow python-opencv python-requests sane libsecret
-./install.sh
+sh install.sh
 ```
 
 `install.sh` creates an isolated runtime venv with access to system site packages and installs `mora` into `~/.local/bin`.

@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile runtime
+        run: python3 -m py_compile mora/*.py
+      - name: Install Mora
+        run: python3 -m pip install --no-deps --no-build-isolation .
+      - name: Check Scan Slicer Emo
+        run: |
+          git clone --depth 1 https://github.com/ziacik/scan-slicer-emo.git
+          mora check scan-slicer-emo/app.mora
+          mora simulate scan-slicer-emo/app.mora 'correction(A)' 'correction(A)' 'correction(A)'
+      - name: Runtime smoke tests
+        run: |
+          python3 - <<'PY'
+          from mora.gtk_backend import BUTTON_RE
+          from mora import faculties
+          assert BUTTON_RE.match('button Delete invites DeleteFrame when selection exists')
+          q=[[10.,10.],[110.,10.],[110.,90.],[10.,90.]]
+          assert faculties.is_valid_quad(q)
+          assert faculties.move_corner(q,0,5,7,200,200)[0] == [15.0,17.0]
+          print('runtime smoke tests: OK')
+          PY
+
+  gtk-import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-pil python3-requests python3-cv2
+      - name: Import GTK backend
+        run: /usr/bin/python3 -m py_compile mora/*.py
+      - name: Verify GI
+        run: |
+          /usr/bin/python3 - <<'PY'
+          import gi
+          gi.require_version('Gtk','4.0')
+          gi.require_version('Adw','1')
+          from gi.repository import Gtk, Adw
+          print('GTK/Adwaita import: OK')
+          PY
